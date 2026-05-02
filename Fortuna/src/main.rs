@@ -3,7 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, Sender},
     thread,
 };
 
@@ -21,6 +21,7 @@ const MAX_MARKET_IDS_PER_REQUEST: usize = 100;
 const MAX_XIVAPI_ROWS_PER_REQUEST: usize = 500;
 
 fn main() -> eframe::Result {
+    log_terminal("Starting Fortuna Profit Crafter.");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]),
         ..Default::default()
@@ -38,17 +39,21 @@ struct ProfitCrafterApp {
     rows: Vec<ProfitRow>,
     gather_rows: Vec<GatherRow>,
     item_categories: Vec<ItemCategory>,
-    selected_categories: HashSet<u32>,
+    pending_item_filter: Option<u32>,
+    applied_item_filter: Option<u32>,
+    pending_category_filter: Option<u32>,
+    applied_category_filter: Option<u32>,
     selected_item_id: Option<u32>,
     selected_recipe_id: Option<u32>,
     selected_cost_breakdown: Vec<CostNode>,
-    recipe_search: String,
-    only_profitable: bool,
-    only_recently_sold: bool,
+    pending_only_profitable: bool,
+    applied_only_profitable: bool,
+    pending_only_recently_sold: bool,
+    applied_only_recently_sold: bool,
     status: String,
-    market_rx: Option<Receiver<Result<MarketSnapshot>>>,
-    solve_rx: Option<Receiver<Result<SolvedMacro>>>,
-    update_rx: Option<Receiver<Result<String>>>,
+    market_rx: Option<Receiver<WorkMessage<MarketSnapshot>>>,
+    solve_rx: Option<Receiver<WorkMessage<SolvedMacro>>>,
+    update_rx: Option<Receiver<WorkMessage<String>>>,
     solved_macro: Option<SolvedMacro>,
     crafter_stats: CrafterStats,
 }
@@ -61,13 +66,17 @@ impl Default for ProfitCrafterApp {
             rows: Vec::new(),
             gather_rows: Vec::new(),
             item_categories: Vec::new(),
-            selected_categories: HashSet::new(),
+            pending_item_filter: None,
+            applied_item_filter: None,
+            pending_category_filter: None,
+            applied_category_filter: None,
             selected_item_id: None,
             selected_recipe_id: None,
             selected_cost_breakdown: Vec::new(),
-            recipe_search: String::new(),
-            only_profitable: true,
-            only_recently_sold: true,
+            pending_only_profitable: true,
+            applied_only_profitable: true,
+            pending_only_recently_sold: true,
+            applied_only_recently_sold: true,
             status: String::new(),
             market_rx: None,
             solve_rx: None,
@@ -85,35 +94,54 @@ impl eframe::App for ProfitCrafterApp {
 
         egui::Panel::top("toolbar").show_inside(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
+                let is_busy = self.is_busy();
                 ui.heading("Fortuna Profit Crafter");
                 ui.separator();
                 ui.label(format!("{DATA_CENTER} / {WORLD}"));
                 ui.separator();
-                if ui.button("Refresh market").clicked() {
+                if ui
+                    .add_enabled(!is_busy, egui::Button::new("Refresh market"))
+                    .clicked()
+                {
                     self.refresh_market(&ctx);
                 }
-                if ui.button("Clone raphael-rs if missing").clicked() {
+                if ui
+                    .add_enabled(!is_busy, egui::Button::new("Clone raphael-rs if missing"))
+                    .clicked()
+                {
                     self.ensure_repository(
                         &ctx,
                         "raphael-rs",
                         "https://github.com/KonaeAkira/raphael-rs.git",
                     );
                 }
-                if ui.button("Clone Universalis if missing").clicked() {
+                if ui
+                    .add_enabled(!is_busy, egui::Button::new("Clone Universalis if missing"))
+                    .clicked()
+                {
                     self.ensure_repository(
                         &ctx,
                         "Universalis",
                         "https://github.com/Universalis-FFXIV/Universalis.git",
                     );
                 }
-                if ui.button("Update XIVAPI cache").clicked() {
+                if ui
+                    .add_enabled(!is_busy, egui::Button::new("Update XIVAPI cache"))
+                    .clicked()
+                {
                     self.update_xivapi_cache(&ctx);
                 }
-                if ui.button("Solve selected macro").clicked() {
+                if ui
+                    .add_enabled(!is_busy, egui::Button::new("Solve selected macro"))
+                    .clicked()
+                {
                     self.solve_selected_macro(&ctx);
                 }
                 if !self.status.is_empty() {
                     ui.separator();
+                    if is_busy {
+                        ui.spinner();
+                    }
                     ui.label(&self.status);
                 }
             });
@@ -150,29 +178,8 @@ impl eframe::App for ProfitCrafterApp {
                 ui.checkbox(&mut self.crafter_stats.quick_innovation, "Quick Innovation");
 
                 ui.separator();
-                ui.label("Recipe filter");
-                ui.text_edit_singleline(&mut self.recipe_search);
-                ui.checkbox(&mut self.only_profitable, "Only profitable");
-                ui.checkbox(&mut self.only_recently_sold, "Only >4 sales in 2 days");
-
-                if !self.item_categories.is_empty() {
-                    ui.separator();
-                    ui.label("XIVAPI item types");
-                    egui::ScrollArea::vertical()
-                        .max_height(260.0)
-                        .show(ui, |ui| {
-                            for category in &self.item_categories {
-                                let mut selected = self.selected_categories.contains(&category.id);
-                                if ui.checkbox(&mut selected, &category.name).changed() {
-                                    if selected {
-                                        self.selected_categories.insert(category.id);
-                                    } else {
-                                        self.selected_categories.remove(&category.id);
-                                    }
-                                }
-                            }
-                        });
-                }
+                ui.label("Filters");
+                self.draw_filter_controls(ui);
 
                 ui.separator();
                 ui.label(format!("Market prices: {}", self.market_prices.len()));
@@ -206,18 +213,23 @@ impl ProfitCrafterApp {
     fn receive_background_work(&mut self, ctx: &egui::Context) {
         if let Some(rx) = self.market_rx.take() {
             match rx.try_recv() {
-                Ok(Ok(snapshot)) => {
+                Ok(WorkMessage::Progress(message)) => {
+                    self.status = message;
+                    self.market_rx = Some(rx);
+                }
+                Ok(WorkMessage::Done(Ok(snapshot))) => {
                     self.item_categories = snapshot.categories;
                     self.market_prices = snapshot.prices;
                     self.rows = rank_profitability(&self.market_prices);
                     self.gather_rows = rank_gathering(&self.market_prices);
+                    self.clear_unavailable_filters();
                     self.status = format!(
                         "Loaded {} prices, XIVAPI item types, NPC vendor prices, and recent sale counts.",
                         self.market_prices.len()
                     );
                     self.market_rx = None;
                 }
-                Ok(Err(err)) => {
+                Ok(WorkMessage::Done(Err(err))) => {
                     self.status = format!("Market refresh failed: {err:#}");
                     self.market_rx = None;
                 }
@@ -231,7 +243,11 @@ impl ProfitCrafterApp {
 
         if let Some(rx) = self.solve_rx.take() {
             match rx.try_recv() {
-                Ok(Ok(solved)) => {
+                Ok(WorkMessage::Progress(message)) => {
+                    self.status = message;
+                    self.solve_rx = Some(rx);
+                }
+                Ok(WorkMessage::Done(Ok(solved))) => {
                     self.status = format!(
                         "Solved {} craft macros with {} total actions.",
                         solved.plans.len(),
@@ -240,7 +256,7 @@ impl ProfitCrafterApp {
                     self.solved_macro = Some(solved);
                     self.solve_rx = None;
                 }
-                Ok(Err(err)) => {
+                Ok(WorkMessage::Done(Err(err))) => {
                     self.status = format!("Macro solve failed: {err:#}");
                     self.solve_rx = None;
                 }
@@ -254,11 +270,15 @@ impl ProfitCrafterApp {
 
         if let Some(rx) = self.update_rx.take() {
             match rx.try_recv() {
-                Ok(Ok(message)) => {
+                Ok(WorkMessage::Progress(message)) => {
+                    self.status = message;
+                    self.update_rx = Some(rx);
+                }
+                Ok(WorkMessage::Done(Ok(message))) => {
                     self.status = message;
                     self.update_rx = None;
                 }
-                Ok(Err(err)) => {
+                Ok(WorkMessage::Done(Err(err))) => {
                     self.status = format!("Update failed: {err:#}");
                     self.update_rx = None;
                 }
@@ -281,7 +301,10 @@ impl ProfitCrafterApp {
         self.status = "Refreshing Universalis market data...".to_string();
         ctx.request_repaint();
         thread::spawn(move || {
-            let _ = tx.send(fetch_market_snapshot());
+            report_progress(&tx, "Preparing market refresh.");
+            let progress = |message| report_progress(&tx, message);
+            let result = fetch_market_snapshot(&progress);
+            let _ = tx.send(WorkMessage::Done(result));
         });
     }
 
@@ -296,10 +319,11 @@ impl ProfitCrafterApp {
         self.status = format!("Ensuring {repo_dir} repository exists...");
         ctx.request_repaint();
         thread::spawn(move || {
+            report_progress(&tx, format!("Checking {repo_dir} repository."));
             let root = workspace_root();
             let result = ensure_repo(&root.join(repo_dir), url)
                 .map(|message| format!("{repo_dir}: {message}"));
-            let _ = tx.send(result);
+            let _ = tx.send(WorkMessage::Done(result));
         });
     }
 
@@ -309,7 +333,9 @@ impl ProfitCrafterApp {
         self.status = "Updating local XIVAPI cache...".to_string();
         ctx.request_repaint();
         thread::spawn(move || {
-            let result = update_xivapi_library().map(|cache| {
+            report_progress(&tx, "Refreshing XIVAPI cache from v2 sheets.");
+            let progress = |message| report_progress(&tx, message);
+            let result = update_xivapi_library(&progress).map(|cache| {
                 format!(
                     "XIVAPI cache updated: {} item types, {} items, {} NPC gil prices.",
                     cache.categories.len(),
@@ -317,7 +343,7 @@ impl ProfitCrafterApp {
                     cache.vendor_prices.len()
                 )
             });
-            let _ = tx.send(result);
+            let _ = tx.send(WorkMessage::Done(result));
         });
     }
 
@@ -337,8 +363,162 @@ impl ProfitCrafterApp {
         self.status = "Solving macros with Raphael...".to_string();
         ctx.request_repaint();
         thread::spawn(move || {
-            let _ = tx.send(solve_macro_plan(recipe_id, recipe, stats, market_prices));
+            report_progress(&tx, "Building craft dependency plan for selected recipe.");
+            let progress = |message| report_progress(&tx, message);
+            let result = solve_macro_plan(recipe_id, recipe, stats, market_prices, &progress);
+            let _ = tx.send(WorkMessage::Done(result));
         });
+    }
+
+    fn draw_filter_controls(&mut self, ui: &mut egui::Ui) {
+        let item_options = self.item_filter_options();
+        egui::ComboBox::from_label("Item")
+            .selected_text(self.selected_item_filter_text())
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.pending_item_filter, None, "All items");
+                for (item_id, name) in item_options {
+                    ui.selectable_value(&mut self.pending_item_filter, Some(item_id), name);
+                }
+            });
+
+        egui::ComboBox::from_label("Item type")
+            .selected_text(self.selected_category_filter_text())
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.pending_category_filter, None, "All item types");
+                for category in &self.item_categories {
+                    ui.selectable_value(
+                        &mut self.pending_category_filter,
+                        Some(category.id),
+                        &category.name,
+                    );
+                }
+            });
+
+        ui.checkbox(&mut self.pending_only_profitable, "Only profitable");
+        ui.checkbox(
+            &mut self.pending_only_recently_sold,
+            "Only >4 sales in 2 days",
+        );
+
+        ui.horizontal(|ui| {
+            let changed = self.filters_have_pending_changes();
+            if ui
+                .add_enabled(changed, egui::Button::new("Apply filters"))
+                .clicked()
+            {
+                self.apply_filters();
+            }
+            if ui.button("Clear").clicked() {
+                self.clear_filters();
+            }
+        });
+
+        if self.filters_have_pending_changes() {
+            ui.small("Filter changes are staged. Click Apply filters to update the ranking.");
+        }
+    }
+
+    fn item_filter_options(&self) -> Vec<(u32, String)> {
+        let mut items = match self.mode {
+            AppMode::Craft => self
+                .rows
+                .iter()
+                .map(|row| (row.item_id, row.item_name.clone()))
+                .collect::<Vec<_>>(),
+            AppMode::Gather => self
+                .gather_rows
+                .iter()
+                .map(|row| (row.item_id, row.item_name.clone()))
+                .collect::<Vec<_>>(),
+        };
+        items.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+        items.dedup_by_key(|(item_id, _)| *item_id);
+        items
+    }
+
+    fn selected_item_filter_text(&self) -> String {
+        self.pending_item_filter
+            .map(|item_id| item_name(item_id))
+            .unwrap_or_else(|| "All items".to_string())
+    }
+
+    fn selected_category_filter_text(&self) -> String {
+        self.pending_category_filter
+            .and_then(|id| {
+                self.item_categories
+                    .iter()
+                    .find(|category| category.id == id)
+                    .map(|category| category.name.clone())
+            })
+            .unwrap_or_else(|| "All item types".to_string())
+    }
+
+    fn filters_have_pending_changes(&self) -> bool {
+        self.pending_item_filter != self.applied_item_filter
+            || self.pending_category_filter != self.applied_category_filter
+            || self.pending_only_profitable != self.applied_only_profitable
+            || self.pending_only_recently_sold != self.applied_only_recently_sold
+    }
+
+    fn apply_filters(&mut self) {
+        self.applied_item_filter = self.pending_item_filter;
+        self.applied_category_filter = self.pending_category_filter;
+        self.applied_only_profitable = self.pending_only_profitable;
+        self.applied_only_recently_sold = self.pending_only_recently_sold;
+        self.status = format!(
+            "Filters applied: {} craft rows, {} gathering rows.",
+            self.filtered_rows().len(),
+            self.filtered_gather_rows().len()
+        );
+    }
+
+    fn clear_filters(&mut self) {
+        self.pending_item_filter = None;
+        self.applied_item_filter = None;
+        self.pending_category_filter = None;
+        self.applied_category_filter = None;
+        self.pending_only_profitable = false;
+        self.applied_only_profitable = false;
+        self.pending_only_recently_sold = false;
+        self.applied_only_recently_sold = false;
+        self.status = "Filters cleared.".to_string();
+    }
+
+    fn clear_unavailable_filters(&mut self) {
+        let available_items = self
+            .rows
+            .iter()
+            .map(|row| row.item_id)
+            .chain(self.gather_rows.iter().map(|row| row.item_id))
+            .collect::<HashSet<_>>();
+        for item_filter in [
+            &mut self.pending_item_filter,
+            &mut self.applied_item_filter,
+        ] {
+            if item_filter.is_some_and(|item_id| !available_items.contains(&item_id)) {
+                *item_filter = None;
+            }
+        }
+
+        let available_categories = self
+            .item_categories
+            .iter()
+            .map(|category| category.id)
+            .collect::<HashSet<_>>();
+        for category_filter in [
+            &mut self.pending_category_filter,
+            &mut self.applied_category_filter,
+        ] {
+            if category_filter.is_some_and(|id| !available_categories.contains(&id)) {
+                *category_filter = None;
+            }
+        }
+    }
+
+    fn is_busy(&self) -> bool {
+        self.market_rx.is_some() || self.solve_rx.is_some() || self.update_rx.is_some()
     }
 
     fn draw_profit_table(&mut self, ui: &mut egui::Ui) {
@@ -415,35 +595,39 @@ impl ProfitCrafterApp {
     }
 
     fn filtered_rows(&self) -> Vec<ProfitRow> {
-        let needle = self.recipe_search.trim().to_lowercase();
         self.rows
             .iter()
-            .filter(|row| !self.only_profitable || row.profit > 0)
-            .filter(|row| !self.only_recently_sold || row.recent_sales_2d > 4)
             .filter(|row| {
-                self.selected_categories.is_empty()
+                self.applied_item_filter
+                    .is_none_or(|item_id| row.item_id == item_id)
+            })
+            .filter(|row| !self.applied_only_profitable || row.profit > 0)
+            .filter(|row| !self.applied_only_recently_sold || row.recent_sales_2d > 4)
+            .filter(|row| {
+                self.applied_category_filter.is_none()
                     || row
                         .search_category_id
-                        .is_some_and(|id| self.selected_categories.contains(&id))
+                        .is_some_and(|id| Some(id) == self.applied_category_filter)
             })
-            .filter(|row| needle.is_empty() || row.item_name.to_lowercase().contains(&needle))
             .cloned()
             .collect()
     }
 
     fn filtered_gather_rows(&self) -> Vec<GatherRow> {
-        let needle = self.recipe_search.trim().to_lowercase();
         self.gather_rows
             .iter()
-            .filter(|row| !self.only_profitable || row.profit > 0)
-            .filter(|row| !self.only_recently_sold || row.recent_sales_2d > 4)
             .filter(|row| {
-                self.selected_categories.is_empty()
+                self.applied_item_filter
+                    .is_none_or(|item_id| row.item_id == item_id)
+            })
+            .filter(|row| !self.applied_only_profitable || row.profit > 0)
+            .filter(|row| !self.applied_only_recently_sold || row.recent_sales_2d > 4)
+            .filter(|row| {
+                self.applied_category_filter.is_none()
                     || row
                         .search_category_id
-                        .is_some_and(|id| self.selected_categories.contains(&id))
+                        .is_some_and(|id| Some(id) == self.applied_category_filter)
             })
-            .filter(|row| needle.is_empty() || row.item_name.to_lowercase().contains(&needle))
             .cloned()
             .collect()
     }
@@ -527,6 +711,12 @@ enum AppMode {
     Gather,
 }
 
+#[derive(Debug)]
+enum WorkMessage<T> {
+    Progress(String),
+    Done(Result<T>),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ItemCategory {
     id: u32,
@@ -573,6 +763,7 @@ struct ProfitRow {
 
 #[derive(Debug, Clone)]
 struct GatherRow {
+    item_id: u32,
     item_name: String,
     category_name: Option<String>,
     search_category_id: Option<u32>,
@@ -695,15 +886,22 @@ struct XivRow {
     fields: Value,
 }
 
-fn fetch_market_snapshot() -> Result<MarketSnapshot> {
+fn fetch_market_snapshot(progress: &dyn Fn(String)) -> Result<MarketSnapshot> {
+    progress("Building HTTP client for Universalis and XIVAPI.".to_string());
     let client = reqwest::blocking::Client::builder()
         .user_agent("FortunaProfitCrafter/0.1")
         .build()?;
     let ids = relevant_market_item_ids();
+    progress(format!("Found {} relevant market item IDs.", ids.len()));
     let mut prices = HashMap::new();
-    let xivapi_cache = load_or_update_xivapi_library()?;
+    let xivapi_cache = load_or_update_xivapi_library(progress)?;
 
-    for chunk in ids.chunks(MAX_MARKET_IDS_PER_REQUEST) {
+    let market_chunks = ids.chunks(MAX_MARKET_IDS_PER_REQUEST).len();
+    for (index, chunk) in ids.chunks(MAX_MARKET_IDS_PER_REQUEST).enumerate() {
+        progress(format!(
+            "Fetching current market prices ({}/{market_chunks}).",
+            index + 1
+        ));
         let joined = chunk
             .iter()
             .map(u32::to_string)
@@ -719,8 +917,10 @@ fn fetch_market_snapshot() -> Result<MarketSnapshot> {
         }
     }
 
-    let recent_sales = fetch_recent_sales_2d(&client)?;
+    progress(format!("Loaded current prices for {} market items.", prices.len()));
+    let recent_sales = fetch_recent_sales_2d(&client, progress)?;
 
+    progress("Merging item categories, vendor prices, and sale counts.".to_string());
     for (item_id, price) in &mut prices {
         price.metadata = xivapi_cache
             .item_metadata
@@ -789,10 +989,21 @@ fn market_price_from_result(result: &AggregatedResult) -> Option<MarketPrice> {
     })
 }
 
-fn load_or_update_xivapi_library() -> Result<XivApiCache> {
+fn load_or_update_xivapi_library(progress: &dyn Fn(String)) -> Result<XivApiCache> {
     match load_xivapi_library() {
-        Ok(cache) if cache_is_usable(&cache) => Ok(cache),
-        _ => update_xivapi_library(),
+        Ok(cache) if cache_is_usable(&cache) => {
+            progress(format!(
+                "Using cached XIVAPI data: {} item types, {} items, {} vendor prices.",
+                cache.categories.len(),
+                cache.item_metadata.len(),
+                cache.vendor_prices.len()
+            ));
+            Ok(cache)
+        }
+        _ => {
+            progress("Local XIVAPI cache is missing or incomplete; updating it now.".to_string());
+            update_xivapi_library(progress)
+        }
     }
 }
 
@@ -814,19 +1025,24 @@ fn load_xivapi_library() -> Result<XivApiCache> {
     })
 }
 
-fn update_xivapi_library() -> Result<XivApiCache> {
+fn update_xivapi_library(progress: &dyn Fn(String)) -> Result<XivApiCache> {
     let client = reqwest::blocking::Client::builder()
         .user_agent("FortunaProfitCrafter/0.1")
         .build()?;
     let item_ids = relevant_market_item_ids();
+    progress(format!(
+        "Fetching XIVAPI metadata for {} relevant item IDs.",
+        item_ids.len()
+    ));
     let cache = XivApiCache {
-        categories: fetch_xivapi_item_categories(&client)
+        categories: fetch_xivapi_item_categories(&client, progress)
             .context("failed to fetch XIVAPI item categories")?,
-        item_metadata: fetch_xivapi_item_metadata(&client, &item_ids)
+        item_metadata: fetch_xivapi_item_metadata(&client, &item_ids, progress)
             .context("failed to fetch XIVAPI item metadata")?,
-        vendor_prices: fetch_xivapi_vendor_prices(&client)
+        vendor_prices: fetch_xivapi_vendor_prices(&client, progress)
             .context("failed to fetch XIVAPI vendor prices")?,
     };
+    progress("Saving XIVAPI cache files.".to_string());
     save_xivapi_library(&cache)?;
     Ok(cache)
 }
@@ -855,7 +1071,11 @@ fn xivapi_cache_dir() -> PathBuf {
     workspace_root().join("xivapi-cache")
 }
 
-fn fetch_xivapi_item_categories(client: &reqwest::blocking::Client) -> Result<Vec<ItemCategory>> {
+fn fetch_xivapi_item_categories(
+    client: &reqwest::blocking::Client,
+    progress: &dyn Fn(String),
+) -> Result<Vec<ItemCategory>> {
+    progress("Fetching XIVAPI item search categories.".to_string());
     let url = "https://v2.xivapi.com/api/sheet/ItemSearchCategory?limit=200&fields=Name";
     let data: XivSheetRows = client.get(url).send()?.error_for_status()?.json()?;
     let mut categories = data
@@ -874,15 +1094,22 @@ fn fetch_xivapi_item_categories(client: &reqwest::blocking::Client) -> Result<Ve
         })
         .collect::<Vec<_>>();
     categories.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+    progress(format!("Loaded {} XIVAPI item types.", categories.len()));
     Ok(categories)
 }
 
 fn fetch_xivapi_item_metadata(
     client: &reqwest::blocking::Client,
     item_ids: &[u32],
+    progress: &dyn Fn(String),
 ) -> Result<HashMap<u32, ItemMetadata>> {
     let mut metadata = HashMap::new();
-    for chunk in item_ids.chunks(MAX_MARKET_IDS_PER_REQUEST) {
+    let chunks = item_ids.chunks(MAX_MARKET_IDS_PER_REQUEST).len();
+    for (index, chunk) in item_ids.chunks(MAX_MARKET_IDS_PER_REQUEST).enumerate() {
+        progress(format!(
+            "Fetching XIVAPI item metadata ({}/{chunks}).",
+            index + 1
+        ));
         let rows = chunk
             .iter()
             .map(u32::to_string)
@@ -918,6 +1145,7 @@ fn fetch_xivapi_item_metadata(
             );
         }
     }
+    progress(format!("Loaded metadata for {} items.", metadata.len()));
     Ok(metadata)
 }
 
@@ -931,11 +1159,16 @@ fn relationship_name(fields: &Value, key: &str) -> Option<String> {
         .filter(|name| !name.trim().is_empty())
 }
 
-fn fetch_xivapi_vendor_prices(client: &reqwest::blocking::Client) -> Result<HashMap<u32, u32>> {
+fn fetch_xivapi_vendor_prices(
+    client: &reqwest::blocking::Client,
+    progress: &dyn Fn(String),
+) -> Result<HashMap<u32, u32>> {
     let mut vendor_prices = HashMap::new();
     let mut after = None;
+    let mut page = 1;
 
     loop {
+        progress(format!("Fetching XIVAPI NPC vendor prices page {page}."));
         let url = match after {
             Some(after) => format!(
                 "https://v2.xivapi.com/api/sheet/GilShopItem?limit={MAX_XIVAPI_ROWS_PER_REQUEST}&after={after}&fields=Item@as(raw),Item.PriceMid"
@@ -970,16 +1203,29 @@ fn fetch_xivapi_vendor_prices(client: &reqwest::blocking::Client) -> Result<Hash
             }
         }
         after = data.rows.last().map(|row| row.row_id);
+        page += 1;
     }
 
+    progress(format!(
+        "Loaded NPC vendor prices for {} items.",
+        vendor_prices.len()
+    ));
     Ok(vendor_prices)
 }
 
-fn fetch_recent_sales_2d(client: &reqwest::blocking::Client) -> Result<HashMap<u32, usize>> {
+fn fetch_recent_sales_2d(
+    client: &reqwest::blocking::Client,
+    progress: &dyn Fn(String),
+) -> Result<HashMap<u32, usize>> {
     let ids = recipe_output_item_ids();
     let mut sales = HashMap::new();
 
-    for chunk in ids.chunks(MAX_MARKET_IDS_PER_REQUEST) {
+    let chunks = ids.chunks(MAX_MARKET_IDS_PER_REQUEST).len();
+    for (index, chunk) in ids.chunks(MAX_MARKET_IDS_PER_REQUEST).enumerate() {
+        progress(format!(
+            "Fetching recent sale history ({}/{chunks}).",
+            index + 1
+        ));
         let joined = chunk
             .iter()
             .map(u32::to_string)
@@ -1001,6 +1247,7 @@ fn fetch_recent_sales_2d(client: &reqwest::blocking::Client) -> Result<HashMap<u
         }
     }
 
+    progress(format!("Loaded recent sale counts for {} recipes.", sales.len()));
     Ok(sales)
 }
 
@@ -1101,6 +1348,7 @@ fn rank_gathering(market_prices: &HashMap<u32, MarketPrice>) -> Vec<GatherRow> {
                 .unwrap_or(price.min_listing);
             let acquisition_cost = price.metadata.vendor_price.unwrap_or(0);
             GatherRow {
+                item_id,
                 item_name: item_name(item_id),
                 category_name: price
                     .metadata
@@ -1273,6 +1521,7 @@ fn solve_macro_plan(
     final_recipe: Recipe,
     crafter_stats: CrafterStats,
     market_prices: HashMap<u32, MarketPrice>,
+    progress: &dyn Fn(String),
 ) -> Result<SolvedMacro> {
     let recipes_by_item_id = RECIPES
         .entries()
@@ -1301,8 +1550,19 @@ fn solve_macro_plan(
         craft_plan.push((final_recipe_id, final_recipe));
     }
 
+    progress(format!(
+        "Solving {} craft macro(s) with Raphael.",
+        craft_plan.len()
+    ));
     let mut plans = Vec::new();
-    for (recipe_id, recipe) in craft_plan {
+    let total = craft_plan.len();
+    for (index, (recipe_id, recipe)) in craft_plan.into_iter().enumerate() {
+        progress(format!(
+            "Solving macro {}/{}: {}.",
+            index + 1,
+            total,
+            item_name(recipe.item_id)
+        ));
         plans.push(solve_one_macro(recipe_id, recipe, crafter_stats)?);
     }
     Ok(SolvedMacro { plans })
@@ -1407,6 +1667,7 @@ fn create_macro_blocks(actions: &[Action]) -> Vec<String> {
 
 fn ensure_repo(path: &Path, url: &str) -> Result<String> {
     if !path.join(".git").exists() {
+        log_terminal(&format!("Cloning {url} into {}.", path.display()));
         let output = Command::new("git")
             .arg("clone")
             .arg(url)
@@ -1422,6 +1683,10 @@ fn ensure_repo(path: &Path, url: &str) -> Result<String> {
 
         let git_dir = path.join(".git");
         if git_dir.exists() {
+            log_terminal(&format!(
+                "Removing nested git metadata from {}.",
+                git_dir.display()
+            ));
             fs::remove_dir_all(&git_dir)
                 .with_context(|| format!("failed to remove {}", git_dir.display()))?;
         }
@@ -1429,6 +1694,7 @@ fn ensure_repo(path: &Path, url: &str) -> Result<String> {
         return Ok("cloned and detached".to_string());
     }
 
+    log_terminal(&format!("Repository already exists at {}.", path.display()));
     Ok("already present".to_string())
 }
 
@@ -1437,6 +1703,16 @@ fn workspace_root() -> PathBuf {
         .parent()
         .expect("Fortuna should live inside Fortuna")
         .to_path_buf()
+}
+
+fn report_progress<T>(tx: &Sender<WorkMessage<T>>, message: impl Into<String>) {
+    let message = message.into();
+    log_terminal(&message);
+    let _ = tx.send(WorkMessage::Progress(message));
+}
+
+fn log_terminal(message: &str) {
+    println!("[Fortuna] {message}");
 }
 
 fn item_name(item_id: u32) -> String {

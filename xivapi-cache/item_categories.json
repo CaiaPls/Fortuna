@@ -1,0 +1,370 @@
+[
+  {
+    "id": 5,
+    "name": "Accessories"
+  },
+  {
+    "id": 79,
+    "name": "Airship/Submersible Components"
+  },
+  {
+    "id": 25,
+    "name": "Alchemist's Tools"
+  },
+  {
+    "id": 16,
+    "name": "Arcanist's Arms"
+  },
+  {
+    "id": 12,
+    "name": "Archer's Arms"
+  },
+  {
+    "id": 4,
+    "name": "Armor"
+  },
+  {
+    "id": 21,
+    "name": "Armorer's Tools"
+  },
+  {
+    "id": 62,
+    "name": "Arrows"
+  },
+  {
+    "id": 78,
+    "name": "Astrologian's Arms"
+  },
+  {
+    "id": 20,
+    "name": "Blacksmith's Tools"
+  },
+  {
+    "id": 33,
+    "name": "Body"
+  },
+  {
+    "id": 52,
+    "name": "Bone"
+  },
+  {
+    "id": 28,
+    "name": "Botanist's Tools"
+  },
+  {
+    "id": 41,
+    "name": "Bracelets"
+  },
+  {
+    "id": 19,
+    "name": "Carpenter's Tools"
+  },
+  {
+    "id": 59,
+    "name": "Catalysts"
+  },
+  {
+    "id": 68,
+    "name": "Chairs and Beds"
+  },
+  {
+    "id": 50,
+    "name": "Cloth"
+  },
+  {
+    "id": 15,
+    "name": "Conjurer's Arms"
+  },
+  {
+    "id": 58,
+    "name": "Crystals"
+  },
+  {
+    "id": 26,
+    "name": "Culinarian's Tools"
+  },
+  {
+    "id": 18,
+    "name": "Dancer's Arms"
+  },
+  {
+    "id": 87,
+    "name": "Dancer's Arms"
+  },
+  {
+    "id": 76,
+    "name": "Dark Knight's Arms"
+  },
+  {
+    "id": 54,
+    "name": "Dyes"
+  },
+  {
+    "id": 40,
+    "name": "Earrings"
+  },
+  {
+    "id": 65,
+    "name": "Exterior Fixtures"
+  },
+  {
+    "id": 37,
+    "name": "Feet"
+  },
+  {
+    "id": 29,
+    "name": "Fisher's Tools"
+  },
+  {
+    "id": 30,
+    "name": "Fishing Tackle"
+  },
+  {
+    "id": 56,
+    "name": "Furnishings"
+  },
+  {
+    "id": 81,
+    "name": "Gardening Items"
+  },
+  {
+    "id": 10,
+    "name": "Gladiator's Arms"
+  },
+  {
+    "id": 22,
+    "name": "Goldsmith's Tools"
+  },
+  {
+    "id": 86,
+    "name": "Gunbreaker's Arms"
+  },
+  {
+    "id": 36,
+    "name": "Hands"
+  },
+  {
+    "id": 31,
+    "name": "Head"
+  },
+  {
+    "id": 44,
+    "name": "Ingredients"
+  },
+  {
+    "id": 66,
+    "name": "Interior Fixtures"
+  },
+  {
+    "id": 13,
+    "name": "Lancer's Arms"
+  },
+  {
+    "id": 51,
+    "name": "Leather"
+  },
+  {
+    "id": 23,
+    "name": "Leatherworker's Tools"
+  },
+  {
+    "id": 35,
+    "name": "Legs"
+  },
+  {
+    "id": 49,
+    "name": "Lumber"
+  },
+  {
+    "id": 77,
+    "name": "Machinist's Arms"
+  },
+  {
+    "id": 11,
+    "name": "Marauder's Arms"
+  },
+  {
+    "id": 57,
+    "name": "Materia"
+  },
+  {
+    "id": 7,
+    "name": "Materials"
+  },
+  {
+    "id": 45,
+    "name": "Meals"
+  },
+  {
+    "id": 43,
+    "name": "Medicine"
+  },
+  {
+    "id": 6,
+    "name": "Medicines"
+  },
+  {
+    "id": 48,
+    "name": "Metal"
+  },
+  {
+    "id": 27,
+    "name": "Miner's Tools"
+  },
+  {
+    "id": 75,
+    "name": "Minions"
+  },
+  {
+    "id": 60,
+    "name": "Miscellany"
+  },
+  {
+    "id": 39,
+    "name": "Necklaces"
+  },
+  {
+    "id": 80,
+    "name": "Orchestrion Components"
+  },
+  {
+    "id": 8,
+    "name": "Other"
+  },
+  {
+    "id": 64,
+    "name": "Other"
+  },
+  {
+    "id": 67,
+    "name": "Outdoor Furnishings"
+  },
+  {
+    "id": 82,
+    "name": "Paintings"
+  },
+  {
+    "id": 92,
+    "name": "Pictomancer's Arms"
+  },
+  {
+    "id": 1,
+    "name": "Primary Arms"
+  },
+  {
+    "id": 2,
+    "name": "Primary Tools"
+  },
+  {
+    "id": 3,
+    "name": "Primary Tools"
+  },
+  {
+    "id": 9,
+    "name": "Pugilist's Arms"
+  },
+  {
+    "id": 63,
+    "name": "Quest Items"
+  },
+  {
+    "id": 53,
+    "name": "Reagents"
+  },
+  {
+    "id": 88,
+    "name": "Reaper's Arms"
+  },
+  {
+    "id": 84,
+    "name": "Red Mage's Arms"
+  },
+  {
+    "id": 90,
+    "name": "Registrable Miscellany"
+  },
+  {
+    "id": 42,
+    "name": "Rings"
+  },
+  {
+    "id": 73,
+    "name": "Rogue's Arms"
+  },
+  {
+    "id": 72,
+    "name": "Rugs"
+  },
+  {
+    "id": 89,
+    "name": "Sage's Arms"
+  },
+  {
+    "id": 83,
+    "name": "Samurai's Arms"
+  },
+  {
+    "id": 85,
+    "name": "Scholar's Arms"
+  },
+  {
+    "id": 46,
+    "name": "Seafood"
+  },
+  {
+    "id": 74,
+    "name": "Seasonal Miscellany"
+  },
+  {
+    "id": 17,
+    "name": "Shields"
+  },
+  {
+    "id": 61,
+    "name": "Soul Crystals"
+  },
+  {
+    "id": 47,
+    "name": "Stone"
+  },
+  {
+    "id": 69,
+    "name": "Tables"
+  },
+  {
+    "id": 70,
+    "name": "Tabletop"
+  },
+  {
+    "id": 14,
+    "name": "Thaumaturge's Arms"
+  },
+  {
+    "id": 34,
+    "name": "Undergarments"
+  },
+  {
+    "id": 32,
+    "name": "Undershirts"
+  },
+  {
+    "id": 91,
+    "name": "Viper's Arms"
+  },
+  {
+    "id": 38,
+    "name": "Waist"
+  },
+  {
+    "id": 71,
+    "name": "Wall-mounted"
+  },
+  {
+    "id": 55,
+    "name": "Weapon Parts"
+  },
+  {
+    "id": 24,
+    "name": "Weaver's Tools"
+  }
+]

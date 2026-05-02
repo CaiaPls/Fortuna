@@ -1002,21 +1002,50 @@ fn fetch_universalis_market_prices(
             "Fetching current market prices ({}/{market_chunks}).",
             index + 1
         ));
-        let joined = chunk
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let url = format!("https://universalis.app/api/v2/aggregated/{WORLD}/{joined}");
-        let response = client.get(url).send()?.error_for_status()?;
-        let data: AggregatedResponse = response.json()?;
-        for result in data.results {
-            if let Some(price) = market_price_from_result(&result) {
-                prices.insert(result.item_id, price);
-            }
-        }
+        fetch_universalis_market_chunk(client, chunk, &mut prices, progress)?;
     }
     Ok(prices)
+}
+
+fn fetch_universalis_market_chunk(
+    client: &reqwest::blocking::Client,
+    ids: &[u32],
+    prices: &mut HashMap<u32, MarketPrice>,
+    progress: &dyn Fn(String),
+) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    let joined = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    let url = format!("https://universalis.app/api/v2/aggregated/{WORLD}/{joined}");
+    let response = client.get(url).send()?;
+    if response.status() == reqwest::StatusCode::BAD_REQUEST {
+        if ids.len() == 1 {
+            progress(format!(
+                "Skipping item {} because Universalis rejected it.",
+                ids[0]
+            ));
+            return Ok(());
+        }
+
+        let midpoint = ids.len() / 2;
+        progress(format!(
+            "Universalis rejected a batch of {} item IDs; splitting it to find valid items.",
+            ids.len()
+        ));
+        fetch_universalis_market_chunk(client, &ids[..midpoint], prices, progress)?;
+        fetch_universalis_market_chunk(client, &ids[midpoint..], prices, progress)?;
+        return Ok(());
+    }
+
+    let data: AggregatedResponse = response.error_for_status()?.json()?;
+    for result in data.results {
+        if let Some(price) = market_price_from_result(&result) {
+            prices.insert(result.item_id, price);
+        }
+    }
+    Ok(())
 }
 
 fn sorted_market_item_ids(prices: &HashMap<u32, MarketPrice>) -> Vec<u32> {

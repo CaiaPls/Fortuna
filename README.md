@@ -50,15 +50,16 @@ To enrich market data, `Fortuna` loads or updates a local XIVAPI cache in `xivap
 
 The cache includes:
 
+- `cache_manifest.json`
 - `item_categories.json`
 - `item_metadata.json`
 - `vendor_prices.json`
 
-When the cache is missing or stale, the app fetches these from XIVAPI v2:
+When the cache is missing, incomplete, or built for an older market-visible item set, the app fetches these from XIVAPI v2. Otherwise, it reuses the stored JSON files and skips the XIVAPI refresh. Fortuna checks Universalis first and only asks XIVAPI for items that currently have market data:
 
 - item search categories and display names,
-- item metadata for the recipe and ingredient IDs,
-- NPC gil vendor prices from the `GilShopItem` sheet.
+- item metadata for Universalis-visible recipe and ingredient IDs,
+- NPC gil vendor prices from item metadata for those same IDs.
 
 This metadata is merged with live Universalis pricing so the app can:
 

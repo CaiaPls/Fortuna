@@ -1,6 +1,7 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
     fs,
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     process::Command,
     sync::mpsc::{self, Receiver, Sender},
@@ -18,10 +19,24 @@ use serde_json::Value;
 const WORLD: &str = "Phoenix";
 const DATA_CENTER: &str = "Light";
 const MAX_MARKET_IDS_PER_REQUEST: usize = 100;
-const MAX_XIVAPI_ROWS_PER_REQUEST: usize = 500;
+const XIVAPI_CACHE_SCHEMA_VERSION: u32 = 3;
 
 fn main() -> eframe::Result {
     log_terminal("Starting Fortuna Profit Crafter.");
+    if std::env::args().any(|arg| arg == "--refresh-xivapi-cache") {
+        let progress = |message: String| log_terminal(&message);
+        match update_xivapi_library(&progress) {
+            Ok(cache) => log_terminal(&format!(
+                "XIVAPI cache ready: {} item types, {} items, {} vendor prices.",
+                cache.categories.len(),
+                cache.item_metadata.len(),
+                cache.vendor_prices.len()
+            )),
+            Err(err) => log_terminal(&format!("XIVAPI cache refresh failed: {err:#}")),
+        }
+        return Ok(());
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]),
         ..Default::default()
@@ -738,6 +753,13 @@ struct XivApiCache {
     vendor_prices: HashMap<u32, u32>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct XivApiCacheManifest {
+    schema_version: u32,
+    relevant_item_count: usize,
+    relevant_item_hash: u64,
+}
+
 #[derive(Debug, Clone)]
 struct MarketPrice {
     min_listing: u32,
@@ -892,32 +914,11 @@ fn fetch_market_snapshot(progress: &dyn Fn(String)) -> Result<MarketSnapshot> {
         .user_agent("FortunaProfitCrafter/0.1")
         .build()?;
     let ids = relevant_market_item_ids();
-    progress(format!("Found {} relevant market item IDs.", ids.len()));
-    let mut prices = HashMap::new();
-    let xivapi_cache = load_or_update_xivapi_library(progress)?;
-
-    let market_chunks = ids.chunks(MAX_MARKET_IDS_PER_REQUEST).len();
-    for (index, chunk) in ids.chunks(MAX_MARKET_IDS_PER_REQUEST).enumerate() {
-        progress(format!(
-            "Fetching current market prices ({}/{market_chunks}).",
-            index + 1
-        ));
-        let joined = chunk
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let url = format!("https://universalis.app/api/v2/aggregated/{WORLD}/{joined}");
-        let response = client.get(url).send()?.error_for_status()?;
-        let data: AggregatedResponse = response.json()?;
-        for result in data.results {
-            if let Some(price) = market_price_from_result(&result) {
-                prices.insert(result.item_id, price);
-            }
-        }
-    }
-
+    progress(format!("Checking {} possible market item IDs.", ids.len()));
+    let mut prices = fetch_universalis_market_prices(&client, &ids, progress)?;
     progress(format!("Loaded current prices for {} market items.", prices.len()));
+    let market_item_ids = sorted_market_item_ids(&prices);
+    let xivapi_cache = load_or_update_xivapi_library(&market_item_ids, progress)?;
     let recent_sales = fetch_recent_sales_2d(&client, progress)?;
 
     progress("Merging item categories, vendor prices, and sale counts.".to_string());
@@ -989,9 +990,48 @@ fn market_price_from_result(result: &AggregatedResult) -> Option<MarketPrice> {
     })
 }
 
-fn load_or_update_xivapi_library(progress: &dyn Fn(String)) -> Result<XivApiCache> {
+fn fetch_universalis_market_prices(
+    client: &reqwest::blocking::Client,
+    ids: &[u32],
+    progress: &dyn Fn(String),
+) -> Result<HashMap<u32, MarketPrice>> {
+    let mut prices = HashMap::new();
+    let market_chunks = ids.chunks(MAX_MARKET_IDS_PER_REQUEST).len();
+    for (index, chunk) in ids.chunks(MAX_MARKET_IDS_PER_REQUEST).enumerate() {
+        progress(format!(
+            "Fetching current market prices ({}/{market_chunks}).",
+            index + 1
+        ));
+        let joined = chunk
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let url = format!("https://universalis.app/api/v2/aggregated/{WORLD}/{joined}");
+        let response = client.get(url).send()?.error_for_status()?;
+        let data: AggregatedResponse = response.json()?;
+        for result in data.results {
+            if let Some(price) = market_price_from_result(&result) {
+                prices.insert(result.item_id, price);
+            }
+        }
+    }
+    Ok(prices)
+}
+
+fn sorted_market_item_ids(prices: &HashMap<u32, MarketPrice>) -> Vec<u32> {
+    let mut item_ids = prices.keys().copied().collect::<Vec<_>>();
+    item_ids.sort_unstable();
+    item_ids
+}
+
+fn load_or_update_xivapi_library(
+    item_ids: &[u32],
+    progress: &dyn Fn(String),
+) -> Result<XivApiCache> {
+    let expected_manifest = xivapi_cache_manifest(item_ids);
     match load_xivapi_library() {
-        Ok(cache) if cache_is_usable(&cache) => {
+        Ok((cache, manifest)) if cache_is_usable(&cache, &manifest, &expected_manifest) => {
             progress(format!(
                 "Using cached XIVAPI data: {} item types, {} items, {} vendor prices.",
                 cache.categories.len(),
@@ -1001,59 +1041,119 @@ fn load_or_update_xivapi_library(progress: &dyn Fn(String)) -> Result<XivApiCach
             Ok(cache)
         }
         _ => {
-            progress("Local XIVAPI cache is missing or incomplete; updating it now.".to_string());
-            update_xivapi_library(progress)
+            progress(
+                "Local XIVAPI cache is missing, stale, or for an older item set; updating it now."
+                    .to_string(),
+            );
+            update_xivapi_library_with_item_ids(item_ids.to_vec(), progress)
         }
     }
 }
 
-fn cache_is_usable(cache: &XivApiCache) -> bool {
+fn cache_is_usable(
+    cache: &XivApiCache,
+    manifest: &XivApiCacheManifest,
+    expected_manifest: &XivApiCacheManifest,
+) -> bool {
     !cache.categories.is_empty()
         && !cache.item_metadata.is_empty()
         && !cache.vendor_prices.is_empty()
+        && manifest.schema_version == expected_manifest.schema_version
+        && manifest.relevant_item_count == expected_manifest.relevant_item_count
+        && manifest.relevant_item_hash == expected_manifest.relevant_item_hash
 }
 
-fn load_xivapi_library() -> Result<XivApiCache> {
+fn load_xivapi_library() -> Result<(XivApiCache, XivApiCacheManifest)> {
     let dir = xivapi_cache_dir();
+    let manifest = read_json_file(&dir.join("cache_manifest.json"))?;
     let categories = read_json_file(&dir.join("item_categories.json"))?;
     let item_metadata = read_json_file(&dir.join("item_metadata.json"))?;
     let vendor_prices = read_json_file(&dir.join("vendor_prices.json"))?;
-    Ok(XivApiCache {
-        categories,
-        item_metadata,
-        vendor_prices,
-    })
+    Ok((
+        XivApiCache {
+            categories,
+            item_metadata,
+            vendor_prices,
+        },
+        manifest,
+    ))
 }
 
 fn update_xivapi_library(progress: &dyn Fn(String)) -> Result<XivApiCache> {
     let client = reqwest::blocking::Client::builder()
         .user_agent("FortunaProfitCrafter/0.1")
         .build()?;
-    let item_ids = relevant_market_item_ids();
+    let ids = relevant_market_item_ids();
     progress(format!(
-        "Fetching XIVAPI metadata for {} relevant item IDs.",
+        "Checking Universalis for {} possible market item IDs before refreshing XIVAPI.",
+        ids.len()
+    ));
+    let prices = fetch_universalis_market_prices(&client, &ids, progress)?;
+    let item_ids = sorted_market_item_ids(&prices);
+    progress(format!(
+        "Universalis returned market data for {} items; refreshing XIVAPI for only those.",
         item_ids.len()
     ));
+    update_xivapi_library_with_client(&client, item_ids, progress)
+}
+
+fn update_xivapi_library_with_item_ids(
+    item_ids: Vec<u32>,
+    progress: &dyn Fn(String),
+) -> Result<XivApiCache> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("FortunaProfitCrafter/0.1")
+        .build()?;
+    update_xivapi_library_with_client(&client, item_ids, progress)
+}
+
+fn update_xivapi_library_with_client(
+    client: &reqwest::blocking::Client,
+    item_ids: Vec<u32>,
+    progress: &dyn Fn(String),
+) -> Result<XivApiCache> {
+    progress(format!(
+        "Fetching XIVAPI metadata for {} Universalis-visible item IDs.",
+        item_ids.len()
+    ));
+    let categories = fetch_xivapi_item_categories(&client, progress)
+        .context("failed to fetch XIVAPI item categories")?;
+    let item_metadata = fetch_xivapi_item_metadata(&client, &item_ids, progress)
+        .context("failed to fetch XIVAPI item metadata")?;
+    let vendor_prices = vendor_prices_from_item_metadata(&item_metadata);
+    progress(format!(
+        "Derived relevant NPC vendor prices for {} items from item metadata.",
+        vendor_prices.len()
+    ));
     let cache = XivApiCache {
-        categories: fetch_xivapi_item_categories(&client, progress)
-            .context("failed to fetch XIVAPI item categories")?,
-        item_metadata: fetch_xivapi_item_metadata(&client, &item_ids, progress)
-            .context("failed to fetch XIVAPI item metadata")?,
-        vendor_prices: fetch_xivapi_vendor_prices(&client, progress)
-            .context("failed to fetch XIVAPI vendor prices")?,
+        categories,
+        item_metadata,
+        vendor_prices,
     };
     progress("Saving XIVAPI cache files.".to_string());
-    save_xivapi_library(&cache)?;
+    save_xivapi_library(&cache, &xivapi_cache_manifest(&item_ids))?;
     Ok(cache)
 }
 
-fn save_xivapi_library(cache: &XivApiCache) -> Result<()> {
+fn save_xivapi_library(cache: &XivApiCache, manifest: &XivApiCacheManifest) -> Result<()> {
     let dir = xivapi_cache_dir();
     fs::create_dir_all(&dir)?;
+    write_json_file(&dir.join("cache_manifest.json"), manifest)?;
     write_json_file(&dir.join("item_categories.json"), &cache.categories)?;
     write_json_file(&dir.join("item_metadata.json"), &cache.item_metadata)?;
     write_json_file(&dir.join("vendor_prices.json"), &cache.vendor_prices)?;
     Ok(())
+}
+
+fn xivapi_cache_manifest(item_ids: &[u32]) -> XivApiCacheManifest {
+    let mut hasher = DefaultHasher::new();
+    XIVAPI_CACHE_SCHEMA_VERSION.hash(&mut hasher);
+    item_ids.hash(&mut hasher);
+    XivApiCacheManifest {
+        schema_version: XIVAPI_CACHE_SCHEMA_VERSION,
+        relevant_item_count: item_ids.len(),
+        relevant_item_hash: hasher.finish(),
+    }
 }
 
 fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
@@ -1159,58 +1259,11 @@ fn relationship_name(fields: &Value, key: &str) -> Option<String> {
         .filter(|name| !name.trim().is_empty())
 }
 
-fn fetch_xivapi_vendor_prices(
-    client: &reqwest::blocking::Client,
-    progress: &dyn Fn(String),
-) -> Result<HashMap<u32, u32>> {
-    let mut vendor_prices = HashMap::new();
-    let mut after = None;
-    let mut page = 1;
-
-    loop {
-        progress(format!("Fetching XIVAPI NPC vendor prices page {page}."));
-        let url = match after {
-            Some(after) => format!(
-                "https://v2.xivapi.com/api/sheet/GilShopItem?limit={MAX_XIVAPI_ROWS_PER_REQUEST}&after={after}&fields=Item@as(raw),Item.PriceMid"
-            ),
-            None => format!(
-                "https://v2.xivapi.com/api/sheet/GilShopItem?limit={MAX_XIVAPI_ROWS_PER_REQUEST}&fields=Item@as(raw),Item.PriceMid"
-            ),
-        };
-        let data: XivSheetRows = client.get(url).send()?.error_for_status()?.json()?;
-        if data.rows.is_empty() {
-            break;
-        }
-        for row in &data.rows {
-            let item_id = row
-                .fields
-                .get("Item@as(raw)")
-                .and_then(Value::as_u64)
-                .and_then(|value| u32::try_from(value).ok());
-            let price = row
-                .fields
-                .get("Item")
-                .and_then(|item| item.get("fields"))
-                .and_then(|fields| fields.get("PriceMid"))
-                .and_then(Value::as_u64)
-                .and_then(|value| u32::try_from(value).ok())
-                .filter(|value| *value > 0);
-            if let (Some(item_id), Some(price)) = (item_id, price) {
-                vendor_prices
-                    .entry(item_id)
-                    .and_modify(|current: &mut u32| *current = (*current).min(price))
-                    .or_insert(price);
-            }
-        }
-        after = data.rows.last().map(|row| row.row_id);
-        page += 1;
-    }
-
-    progress(format!(
-        "Loaded NPC vendor prices for {} items.",
-        vendor_prices.len()
-    ));
-    Ok(vendor_prices)
+fn vendor_prices_from_item_metadata(metadata: &HashMap<u32, ItemMetadata>) -> HashMap<u32, u32> {
+    metadata
+        .iter()
+        .filter_map(|(&item_id, metadata)| metadata.vendor_price.map(|price| (item_id, price)))
+        .collect()
 }
 
 fn fetch_recent_sales_2d(

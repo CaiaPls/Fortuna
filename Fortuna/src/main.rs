@@ -1435,7 +1435,7 @@ fn ensure_repo(path: &Path, url: &str) -> Result<String> {
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("profit-crafter should live inside Fortuna")
+        .expect("Fortuna should live inside Fortuna")
         .to_path_buf()
 }
 

@@ -1,9 +1,9 @@
 @echo off
 setlocal
 
-set "APP_DIR=%~dp0profit-crafter"
-set "RELEASE_EXE=%APP_DIR%\target\release\profit-crafter.exe"
-set "DEBUG_EXE=%APP_DIR%\target\debug\profit-crafter.exe"
+set "APP_DIR=%~dp0Fortuna"
+set "RELEASE_EXE=%APP_DIR%\target\release\Fortuna.exe"
+set "DEBUG_EXE=%APP_DIR%\target\debug\Fortuna.exe"
 
 if exist "%RELEASE_EXE%" (
     start "" "%RELEASE_EXE%"

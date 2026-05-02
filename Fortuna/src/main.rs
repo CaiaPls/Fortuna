@@ -61,6 +61,7 @@ struct ProfitCrafterApp {
     selected_item_id: Option<u32>,
     selected_recipe_id: Option<u32>,
     selected_cost_breakdown: Vec<CostNode>,
+    item_search: String,
     pending_only_profitable: bool,
     applied_only_profitable: bool,
     pending_only_recently_sold: bool,
@@ -88,6 +89,7 @@ impl Default for ProfitCrafterApp {
             selected_item_id: None,
             selected_recipe_id: None,
             selected_cost_breakdown: Vec::new(),
+            item_search: String::new(),
             pending_only_profitable: true,
             applied_only_profitable: true,
             pending_only_recently_sold: true,
@@ -113,6 +115,9 @@ impl eframe::App for ProfitCrafterApp {
                 ui.heading("Fortuna Profit Crafter");
                 ui.separator();
                 ui.label(format!("{DATA_CENTER} / {WORLD}"));
+                ui.separator();
+                ui.selectable_value(&mut self.mode, AppMode::Craft, "Craft");
+                ui.selectable_value(&mut self.mode, AppMode::Gather, "Gather");
                 ui.separator();
                 if ui
                     .add_enabled(!is_busy, egui::Button::new("Refresh market"))
@@ -386,6 +391,38 @@ impl ProfitCrafterApp {
     }
 
     fn draw_filter_controls(&mut self, ui: &mut egui::Ui) {
+        ui.label("Search items");
+        let mut search_changed = false;
+        ui.horizontal(|ui| {
+            let response = ui.text_edit_singleline(&mut self.item_search);
+            search_changed |= response.changed();
+            if ui
+                .add_enabled(
+                    !self.item_search.is_empty(),
+                    egui::Button::new("Clear search"),
+                )
+                .clicked()
+            {
+                self.item_search.clear();
+                search_changed = true;
+            }
+        });
+        if search_changed {
+            self.status = match self.mode {
+                AppMode::Craft => {
+                    format!("Search matched {} craft rows.", self.filtered_rows().len())
+                }
+                AppMode::Gather => {
+                    format!(
+                        "Search matched {} gathering rows.",
+                        self.filtered_gather_rows().len()
+                    )
+                }
+            };
+        }
+        ui.small("Search updates the visible list immediately. Dropdown filters apply only when you click Apply filters.");
+
+        ui.separator();
         let item_options = self.item_filter_options();
         egui::ComboBox::from_label("Item")
             .selected_text(self.selected_item_filter_text())
@@ -508,10 +545,7 @@ impl ProfitCrafterApp {
             .map(|row| row.item_id)
             .chain(self.gather_rows.iter().map(|row| row.item_id))
             .collect::<HashSet<_>>();
-        for item_filter in [
-            &mut self.pending_item_filter,
-            &mut self.applied_item_filter,
-        ] {
+        for item_filter in [&mut self.pending_item_filter, &mut self.applied_item_filter] {
             if item_filter.is_some_and(|item_id| !available_items.contains(&item_id)) {
                 *item_filter = None;
             }
@@ -612,6 +646,7 @@ impl ProfitCrafterApp {
     fn filtered_rows(&self) -> Vec<ProfitRow> {
         self.rows
             .iter()
+            .filter(|row| self.item_matches_search(&row.item_name))
             .filter(|row| {
                 self.applied_item_filter
                     .is_none_or(|item_id| row.item_id == item_id)
@@ -631,6 +666,7 @@ impl ProfitCrafterApp {
     fn filtered_gather_rows(&self) -> Vec<GatherRow> {
         self.gather_rows
             .iter()
+            .filter(|row| self.item_matches_search(&row.item_name))
             .filter(|row| {
                 self.applied_item_filter
                     .is_none_or(|item_id| row.item_id == item_id)
@@ -645,6 +681,11 @@ impl ProfitCrafterApp {
             })
             .cloned()
             .collect()
+    }
+
+    fn item_matches_search(&self, item_name: &str) -> bool {
+        let needle = self.item_search.trim();
+        needle.is_empty() || item_name.to_lowercase().contains(&needle.to_lowercase())
     }
 
     fn draw_selected_recipe(&mut self, ui: &mut egui::Ui) {
@@ -916,7 +957,10 @@ fn fetch_market_snapshot(progress: &dyn Fn(String)) -> Result<MarketSnapshot> {
     let ids = relevant_market_item_ids();
     progress(format!("Checking {} possible market item IDs.", ids.len()));
     let mut prices = fetch_universalis_market_prices(&client, &ids, progress)?;
-    progress(format!("Loaded current prices for {} market items.", prices.len()));
+    progress(format!(
+        "Loaded current prices for {} market items.",
+        prices.len()
+    ));
     let market_item_ids = sorted_market_item_ids(&prices);
     let xivapi_cache = load_or_update_xivapi_library(&market_item_ids, progress)?;
     let recent_sales = fetch_recent_sales_2d(&client, progress)?;
@@ -1329,7 +1373,10 @@ fn fetch_recent_sales_2d(
         }
     }
 
-    progress(format!("Loaded recent sale counts for {} recipes.", sales.len()));
+    progress(format!(
+        "Loaded recent sale counts for {} recipes.",
+        sales.len()
+    ));
     Ok(sales)
 }
 

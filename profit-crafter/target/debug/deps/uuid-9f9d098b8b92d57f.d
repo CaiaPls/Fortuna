@@ -1,0 +1,13 @@
+D:\art\FFXIV\Fortuna\profit-crafter\target\debug\deps\uuid-9f9d098b8b92d57f.d: C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\lib.rs C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\macros.rs C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\builder.rs C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\error.rs C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\non_nil.rs C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\parser.rs C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\fmt.rs C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\timestamp.rs C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\external.rs
+
+D:\art\FFXIV\Fortuna\profit-crafter\target\debug\deps\libuuid-9f9d098b8b92d57f.rmeta: C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\lib.rs C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\macros.rs C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\builder.rs C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\error.rs C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\non_nil.rs C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\parser.rs C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\fmt.rs C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\timestamp.rs C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\external.rs
+
+C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\lib.rs:
+C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\macros.rs:
+C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\builder.rs:
+C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\error.rs:
+C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\non_nil.rs:
+C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\parser.rs:
+C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\fmt.rs:
+C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\timestamp.rs:
+C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.23.1\src\external.rs:

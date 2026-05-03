@@ -11,6 +11,7 @@ It helps FFXIV crafters and gatherers by:
 - ranking craftable items by profit,
 - ranking gatherable items by profit and NPC vendor buy price,
 - showing recent sale counts and daily velocity,
+- ranking by profit or by sales in the past 4 days,
 - explaining craft cost breakdowns across ingredient trees,
 - generating optimized crafting macros using the `raphael-rs` solver.
 
@@ -53,19 +54,24 @@ The cache includes:
 - `cache_manifest.json`
 - `item_categories.json`
 - `item_metadata.json`
+- `market_snapshot.json`
+- `recipe_materials.json`
 - `vendor_prices.json`
 
 When the cache is missing, incomplete, or built for an older market-visible item set, the app fetches these from XIVAPI v2. Otherwise, it reuses the stored JSON files and skips the XIVAPI refresh. Fortuna checks Universalis first and only asks XIVAPI for items that currently have market data:
 
 - item search categories and display names,
 - item metadata for Universalis-visible recipe and ingredient IDs,
+- recipe material lists for Raphael craftable outputs,
 - NPC gil vendor prices from item metadata for those same IDs.
+
+Universalis market data is also stored locally in `market_snapshot.json` after a market refresh. Fortuna loads that snapshot on startup and only contacts Universalis again when you click `Refresh market`.
 
 This metadata is merged with live Universalis pricing so the app can:
 
 - bucket items by XIVAPI search categories,
 - compare market price vs. vendor price,
-- calculate whether to buy ingredients or craft them,
+- calculate whether to buy ingredients or craft them using XIVAPI recipe materials when cached,
 - explain cost sources in the recipe tree.
 
 ### Crafting and macro solving

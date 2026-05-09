@@ -7,9 +7,9 @@ edition = "2024"
 anyhow = "1"
 eframe = "0.34.1"
 egui = "0.34.1"
-raphael-data = { path = "../raphael-rs/raphael-data" }
-raphael-sim = { path = "../raphael-rs/raphael-sim" }
-raphael-solver = { path = "../raphael-rs/raphael-solver" }
+raphael-data = { path = "../Source/raphael-rs/raphael-data" }
+raphael-sim = { path = "../Source/raphael-rs/raphael-sim" }
+raphael-solver = { path = "../Source/raphael-rs/raphael-solver" }
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

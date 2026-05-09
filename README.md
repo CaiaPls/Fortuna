@@ -20,20 +20,33 @@ It helps FFXIV crafters and gatherers by:
 - `Fortuna/`
   - Native GUI application that loads FFXIV recipe data, market prices, and item metadata.
   - Uses `raphael-data`, `raphael-sim`, and `raphael-solver` from the local `raphael-rs` workspace.
-  - Fetches market data from Universalis and caches XIVAPI lookup data locally.
+  - Fetches market data from Universalis and caches SaintCoinach lookup data locally.
 
-- `raphael-rs/`
+- `Source/raphael-rs/`
   - Crafting rotation solver for FFXIV.
   - Provides the game data, simulation engine, and solver logic used by `Fortuna`.
   - Includes a CLI and other Rust workspace crates.
 
-- `Universalis/`
+- `Source/Universalis/`
   - Full FFXIV market board aggregator project.
   - `Fortuna` uses the public Universalis API for live market and history data.
 
-- `xivapi-cache/`
-  - Local cache area for XIVAPI lookup assets.
+- `Source/SaintCoinach/`
+  - Game-data reader used by the local Fortuna SaintCoinach exporter.
+
+- `Cache/SaintCoinach/`
+  - Local cache area for SaintCoinach-exported game lookup assets.
   - Stores generated files used by `Fortuna` to reduce network requests and speed startup.
+
+- `Cache/Universalis/`
+  - Local cache area for Universalis market snapshots.
+
+- `Cache/XIVAPI/`
+  - Legacy cache area from the old XIVAPI implementation.
+  - Current Fortuna code no longer writes SaintCoinach or Universalis data here.
+
+- `Source/Fortuna.SaintCoinachExporter/`
+  - Small .NET exporter that reads the local FFXIV install through SaintCoinach and writes Fortuna's JSON cache files.
 
 ## How information is gathered
 
@@ -45,33 +58,41 @@ It helps FFXIV crafters and gatherers by:
 - Recent sale history is fetched from the Universalis history API endpoint.
 - The app loads all relevant output and ingredient item IDs from `raphael-data` recipes.
 
-### Item metadata and vendor prices
+### Item metadata, game data, and vendor prices
 
-To enrich market data, `Fortuna` loads or updates a local XIVAPI cache in `xivapi-cache/`.
+To enrich market data, `Fortuna` loads or updates local SaintCoinach exports in `Cache/SaintCoinach/`.
 
 The cache includes:
 
 - `cache_manifest.json`
+- `gathering_items.json`
 - `item_categories.json`
 - `item_metadata.json`
+- `maps.json`
 - `market_snapshot.json`
+- `npcs.json`
+- `places.json`
 - `recipe_materials.json`
+- `shops.json`
+- `territories.json`
 - `vendor_prices.json`
 
-When the cache is missing, incomplete, or built for an older market-visible item set, the app fetches these from XIVAPI v2. Otherwise, it reuses the stored JSON files and skips the XIVAPI refresh. Fortuna checks Universalis first and only asks XIVAPI for items that currently have market data:
+When the cache is missing, incomplete, or built for an older market-visible item set, the app uses the local SaintCoinach checkout and your local FFXIV install to regenerate these files. Otherwise, it reuses the stored JSON files and skips the export. Fortuna checks Universalis first and only asks the exporter for items that currently have market data, plus recipe materials:
 
 - item search categories and display names,
 - item metadata for Universalis-visible recipe and ingredient IDs,
-- recipe material lists for Raphael craftable outputs,
-- NPC gil vendor prices from item metadata for those same IDs.
+- recipe material lists,
+- gathering items,
+- NPC, shop, map, territory, and place names,
+- NPC gil vendor prices from item metadata.
 
-Universalis market data is also stored locally in `market_snapshot.json` after a market refresh. Fortuna loads that snapshot on startup and only contacts Universalis again when you click `Refresh market`.
+Universalis market data is stored locally in `Cache/Universalis/market_snapshot.json` after a market refresh. Fortuna loads that snapshot on startup and only contacts Universalis again when you click the Universalis refresh button.
 
 This metadata is merged with live Universalis pricing so the app can:
 
-- bucket items by XIVAPI search categories,
+- bucket items by item search categories,
 - compare market price vs. vendor price,
-- calculate whether to buy ingredients or craft them using XIVAPI recipe materials when cached,
+- calculate whether to buy ingredients or craft them using SaintCoinach recipe materials when cached,
 - explain cost sources in the recipe tree.
 
 ### Crafting and macro solving
@@ -85,15 +106,17 @@ This metadata is merged with live Universalis pricing so the app can:
 ## Usage notes
 
 - The app is configured for the `Phoenix` world and `Light` data center by default.
-- The UI includes buttons to clone missing repositories (`raphael-rs` and `Universalis`) and update the local XIVAPI cache.
-- Cached XIVAPI files are regenerable and safe to delete; the app will recreate them when refreshed.
+- The UI includes buttons to clone missing repositories (`raphael-rs`, `Universalis`, and `SaintCoinach`) and update the local game data cache.
+- Cached game data files are regenerable and safe to delete; the app will recreate them when refreshed.
+- The SaintCoinach exporter needs the .NET SDK and a local FFXIV install. If Fortuna cannot auto-detect the install, set `FORTUNA_FFXIV_GAME_DIR` to the folder containing `game\ffxivgame.ver`.
 
 ## Development
 
 This workspace is primarily a Rust-based toolchain with local workspace dependencies.
 
-- `Fortuna/` depends on the local `raphael-rs` workspace crates.
-- `xivapi-cache/` is a local cache directory, not a compiled crate.
-- `Universalis/` is included as a reference archive of the market aggregator project.
+- `Fortuna/` depends on the local `Source/raphael-rs` workspace crates.
+- `Cache/SaintCoinach/` and `Cache/Universalis/` are local cache directories, not compiled crates.
+- `Cache/XIVAPI/` is legacy data from the previous XIVAPI path and is no longer used for new SaintCoinach exports.
+- External source checkouts live under `Source/`.
 
-If you want to run or extend the app, start with `Fortuna/src/main.rs` and the local `raphael-rs` crates.
+If you want to run or extend the app, start with `Fortuna/src/main.rs` and the local `Source/raphael-rs` crates.

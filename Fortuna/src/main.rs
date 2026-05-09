@@ -17,25 +17,26 @@ use raphael_data::{
 use raphael_sim::{Action, SimulationState};
 use raphael_solver::{AtomicFlag, MacroSolver, SolverSettings};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 const WORLD: &str = "Phoenix";
 const DATA_CENTER: &str = "Light";
 const MAX_MARKET_IDS_PER_REQUEST: usize = 100;
-const XIVAPI_CACHE_SCHEMA_VERSION: u32 = 4;
+const GAME_DATA_CACHE_SCHEMA_VERSION: u32 = 5;
 
 fn main() -> eframe::Result {
     log_terminal("Starting Fortuna Profit Crafter.");
-    if std::env::args().any(|arg| arg == "--refresh-xivapi-cache") {
+    if std::env::args()
+        .any(|arg| arg == "--refresh-saintcoinach-cache" || arg == "--refresh-game-data-cache")
+    {
         let progress = |message: String| log_terminal(&message);
-        match update_xivapi_library(&progress) {
+        match refresh_saintcoinach_data(&progress) {
             Ok(cache) => log_terminal(&format!(
-                "XIVAPI cache ready: {} item types, {} items, {} vendor prices.",
+                "Game data cache ready: {} item types, {} items, {} vendor prices.",
                 cache.categories.len(),
                 cache.item_metadata.len(),
                 cache.vendor_prices.len()
             )),
-            Err(err) => log_terminal(&format!("XIVAPI cache refresh failed: {err:#}")),
+            Err(err) => log_terminal(&format!("Game data cache refresh failed: {err:#}")),
         }
         return Ok(());
     }
@@ -59,6 +60,7 @@ struct ProfitCrafterApp {
     item_categories: Vec<ItemCategory>,
     item_metadata: HashMap<u32, ItemMetadata>,
     recipe_materials: HashMap<u32, Vec<RecipeMaterial>>,
+    gathering_items: Vec<GatheringItemInfo>,
     pending_item_filter: Option<u32>,
     applied_item_filter: Option<u32>,
     pending_category_filter: Option<u32>,
@@ -75,6 +77,7 @@ struct ProfitCrafterApp {
     applied_only_recently_sold: bool,
     sale_value_mode: SaleValueMode,
     ranking_mode: RankingMode,
+    sales_graph_mode: SalesGraphMode,
     status: String,
     activity_log: VecDeque<String>,
     market_rx: Option<Receiver<WorkMessage<MarketSnapshot>>>,
@@ -86,19 +89,21 @@ struct ProfitCrafterApp {
 
 impl Default for ProfitCrafterApp {
     fn default() -> Self {
-        let (item_categories, item_metadata, recipe_materials, mut status) =
-            match load_xivapi_library() {
+        let (item_categories, item_metadata, recipe_materials, gathering_items, mut status) =
+            match load_game_data_cache() {
                 Ok((cache, _)) => (
                     cache.categories,
                     cache.item_metadata,
                     cache.recipe_materials,
-                    "Loaded stored XIVAPI item types and recipe materials.".to_string(),
+                    cache.gathering_items,
+                    "Loaded stored SaintCoinach item types and recipe materials.".to_string(),
                 ),
                 Err(_) => (
                     Vec::new(),
                     HashMap::new(),
                     HashMap::new(),
-                    "No stored XIVAPI item types or recipe materials loaded.".to_string(),
+                    Vec::new(),
+                    "No stored SaintCoinach item types or recipe materials loaded.".to_string(),
                 ),
             };
         let (market_prices, rows, gather_rows) = match load_market_snapshot() {
@@ -111,6 +116,7 @@ impl Default for ProfitCrafterApp {
                 );
                 let gather_rows = rank_gathering(
                     &snapshot.prices,
+                    &gathering_items,
                     SaleValueMode::AverageLastFour,
                     RankingMode::Profit,
                 );
@@ -134,6 +140,7 @@ impl Default for ProfitCrafterApp {
             item_categories,
             item_metadata,
             recipe_materials,
+            gathering_items,
             pending_item_filter: None,
             applied_item_filter: None,
             pending_category_filter: None,
@@ -150,6 +157,7 @@ impl Default for ProfitCrafterApp {
             applied_only_recently_sold: false,
             sale_value_mode: SaleValueMode::AverageLastFour,
             ranking_mode: RankingMode::Profit,
+            sales_graph_mode: SalesGraphMode::Quantity,
             status,
             activity_log,
             market_rx: None,
@@ -176,38 +184,52 @@ impl eframe::App for ProfitCrafterApp {
                 ui.selectable_value(&mut self.mode, AppMode::Craft, "Craft");
                 ui.selectable_value(&mut self.mode, AppMode::Gather, "Gather");
                 ui.separator();
+                ui.label("Sources:");
                 if ui
-                    .add_enabled(!is_busy, egui::Button::new("Refresh market"))
+                    .add_enabled(!is_busy, egui::Button::new("Update Universalis market"))
                     .clicked()
                 {
                     self.refresh_market(&ctx);
                 }
                 if ui
-                    .add_enabled(!is_busy, egui::Button::new("Clone raphael-rs if missing"))
+                    .add_enabled(!is_busy, egui::Button::new("Refresh SaintCoinach data"))
+                    .clicked()
+                {
+                    self.refresh_saintcoinach_data(&ctx);
+                }
+                ui.separator();
+                ui.label("Repos:");
+                if ui
+                    .add_enabled(!is_busy, egui::Button::new("Ensure raphael-rs"))
                     .clicked()
                 {
                     self.ensure_repository(
                         &ctx,
-                        "raphael-rs",
+                        "Source/raphael-rs",
                         "https://github.com/KonaeAkira/raphael-rs.git",
                     );
                 }
                 if ui
-                    .add_enabled(!is_busy, egui::Button::new("Clone Universalis if missing"))
+                    .add_enabled(!is_busy, egui::Button::new("Ensure Universalis"))
                     .clicked()
                 {
                     self.ensure_repository(
                         &ctx,
-                        "Universalis",
+                        "Source/Universalis",
                         "https://github.com/Universalis-FFXIV/Universalis.git",
                     );
                 }
                 if ui
-                    .add_enabled(!is_busy, egui::Button::new("Update XIVAPI cache"))
+                    .add_enabled(!is_busy, egui::Button::new("Ensure SaintCoinach"))
                     .clicked()
                 {
-                    self.update_xivapi_cache(&ctx);
+                    self.ensure_repository(
+                        &ctx,
+                        "Source/SaintCoinach",
+                        "https://github.com/xivapi/SaintCoinach.git",
+                    );
                 }
+                ui.separator();
                 if ui
                     .add_enabled(!is_busy, egui::Button::new("Solve selected macro"))
                     .clicked()
@@ -290,8 +312,12 @@ impl ProfitCrafterApp {
             self.sale_value_mode,
             self.ranking_mode,
         );
-        self.gather_rows =
-            rank_gathering(&self.market_prices, self.sale_value_mode, self.ranking_mode);
+        self.gather_rows = rank_gathering(
+            &self.market_prices,
+            &self.gathering_items,
+            self.sale_value_mode,
+            self.ranking_mode,
+        );
     }
 
     fn receive_background_work(&mut self, ctx: &egui::Context) {
@@ -307,14 +333,15 @@ impl ProfitCrafterApp {
                     }
                     self.item_categories = snapshot.categories;
                     self.market_prices = snapshot.prices;
-                    if let Ok((cache, _)) = load_xivapi_library() {
+                    if let Ok((cache, _)) = load_game_data_cache() {
                         self.recipe_materials = cache.recipe_materials;
                         self.item_metadata = cache.item_metadata;
+                        self.gathering_items = cache.gathering_items;
                     }
                     self.rebuild_rankings();
                     self.clear_unavailable_filters();
                     self.set_status(format!(
-                        "Loaded {} prices, XIVAPI item types, NPC vendor prices, and recent sale counts.",
+                        "Loaded {} prices, SaintCoinach item types, NPC vendor prices, and recent sale counts.",
                         self.market_prices.len()
                     ));
                     self.market_rx = None;
@@ -365,10 +392,11 @@ impl ProfitCrafterApp {
                     self.update_rx = Some(rx);
                 }
                 Ok(WorkMessage::Done(Ok(message))) => {
-                    if let Ok((cache, _)) = load_xivapi_library() {
+                    if let Ok((cache, _)) = load_game_data_cache() {
                         self.item_categories = cache.categories;
                         self.item_metadata = cache.item_metadata;
                         self.recipe_materials = cache.recipe_materials;
+                        self.gathering_items = cache.gathering_items;
                         self.rebuild_rankings();
                     }
                     self.set_status(message);
@@ -426,17 +454,17 @@ impl ProfitCrafterApp {
         });
     }
 
-    fn update_xivapi_cache(&mut self, ctx: &egui::Context) {
+    fn refresh_saintcoinach_data(&mut self, ctx: &egui::Context) {
         let (tx, rx) = mpsc::channel();
         self.update_rx = Some(rx);
-        self.set_status("Updating local XIVAPI cache...");
+        self.set_status("Refreshing local SaintCoinach game data...");
         ctx.request_repaint();
         thread::spawn(move || {
-            report_progress(&tx, "Refreshing XIVAPI cache from v2 sheets.");
+            report_progress(&tx, "Refreshing game data cache from SaintCoinach.");
             let progress = |message| report_progress(&tx, message);
-            let result = update_xivapi_library(&progress).map(|cache| {
+            let result = refresh_saintcoinach_data(&progress).map(|cache| {
                 format!(
-                    "XIVAPI cache updated: {} item types, {} items, {} NPC gil prices, {} recipe material lists.",
+                    "Game data cache updated: {} item types, {} items, {} NPC gil prices, {} recipe material lists.",
                     cache.categories.len(),
                     cache.item_metadata.len(),
                     cache.vendor_prices.len(),
@@ -611,6 +639,11 @@ impl ProfitCrafterApp {
                     &mut self.ranking_mode,
                     RankingMode::RecentSales4d,
                     RankingMode::RecentSales4d.label(),
+                );
+                ui.selectable_value(
+                    &mut self.ranking_mode,
+                    RankingMode::RecentQuantity4d,
+                    RankingMode::RecentQuantity4d.label(),
                 );
             });
         if self.ranking_mode != previous_ranking_mode {
@@ -896,8 +929,10 @@ impl ProfitCrafterApp {
                         ui.strong(format!("Profit {}", format_gil_signed(row.profit)));
                         ui.label(format!("Sell {}", format_gil(row.sell_price)));
                         ui.label(format!("Cost {}", format_gil(row.craft_cost)));
+                        ui.label(format!("{} sales/1d", row.recent_sales_1d));
                         ui.label(format!("{} sales/2d", row.recent_sales_2d));
                         ui.label(format!("{} sales/4d", row.recent_sales_4d));
+                        ui.label(format!("{} qty/4d", row.recent_quantity_4d));
                         ui.label(format!("{:.2}/day", row.daily_velocity));
                     });
                     ui.small(row.category_name.as_deref().unwrap_or("Unknown"));
@@ -907,7 +942,7 @@ impl ProfitCrafterApp {
     }
 
     fn draw_gather_table(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Most profitable gathering");
+        ui.heading("Gatherable items");
         let rows = self.filtered_gather_rows();
         ui.label(format!(
             "Showing {} of {} gathering rows",
@@ -915,7 +950,7 @@ impl ProfitCrafterApp {
             self.gather_rows.len()
         ));
         if self.gather_rows.is_empty() {
-            ui.label("Waiting for Universalis market data.");
+            ui.label("Waiting for SaintCoinach gathering data.");
         }
         ui.separator();
         egui::ScrollArea::vertical()
@@ -933,19 +968,23 @@ impl ProfitCrafterApp {
                         self.select_gather_row(&row);
                     }
                     ui.horizontal_wrapped(|ui| {
-                        ui.strong(format!("Profit {}", format_gil_signed(row.profit)));
-                        ui.label(format!("Sell {}", format_gil(row.sell_price)));
-                        ui.label(format!(
-                            "NPC {}",
-                            row.vendor_price
-                                .map(format_gil)
-                                .unwrap_or_else(|| "No".to_string())
-                        ));
+                        ui.strong(format!("Unit {}", format_gil(row.sell_price)));
+                        ui.label(format!("{} sales/1d", row.recent_sales_1d));
                         ui.label(format!("{} sales/2d", row.recent_sales_2d));
                         ui.label(format!("{} sales/4d", row.recent_sales_4d));
+                        ui.label(format!(
+                            "{} / {} / {} qty sold",
+                            row.recent_quantity_1d, row.recent_quantity_2d, row.recent_quantity_4d
+                        ));
                         ui.label(format!("{:.2}/day", row.daily_velocity));
                     });
-                    ui.small(row.category_name.as_deref().unwrap_or("Unknown"));
+                    ui.small(format!("Node: {}", row.node_type));
+                    ui.small(format!("Where: {}", row.where_text));
+                    if row.timed_windows.is_empty() {
+                        ui.small("Always available or timing unknown");
+                    } else {
+                        ui.small(format!("Timed: {}", row.timed_windows.join(", ")));
+                    }
                     ui.separator();
                 }
             });
@@ -1012,6 +1051,37 @@ impl ProfitCrafterApp {
                 ui.label(format!("Cost: {}", format_gil(row.craft_cost)));
                 ui.label(format!("Profit: {}", format_gil_signed(row.profit)));
             });
+        } else if let Some(row) = self.gather_rows.iter().find(|row| row.item_id == item_id) {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("Unit: {}", format_gil(row.sell_price)));
+                ui.label(format!("{} sales/1d", row.recent_sales_1d));
+                ui.label(format!("{} sales/2d", row.recent_sales_2d));
+                ui.label(format!("{} sales/4d", row.recent_sales_4d));
+                ui.label(format!("{} qty/4d", row.recent_quantity_4d));
+            });
+            ui.small(format!("Node: {}", row.node_type));
+            ui.small(format!("Where: {}", row.where_text));
+            if !row.timed_windows.is_empty() {
+                ui.small(format!("Timed: {}", row.timed_windows.join(", ")));
+            }
+        }
+
+        if let Some(price) = self.market_prices.get(&item_id) {
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Past week");
+                ui.selectable_value(
+                    &mut self.sales_graph_mode,
+                    SalesGraphMode::Quantity,
+                    SalesGraphMode::Quantity.label(),
+                );
+                ui.selectable_value(
+                    &mut self.sales_graph_mode,
+                    SalesGraphMode::Value,
+                    SalesGraphMode::Value.label(),
+                );
+            });
+            draw_sales_graph(ui, &price.daily_history, self.sales_graph_mode);
         }
 
         if let Some(recipe_id) = self.selected_recipe_id {
@@ -1164,13 +1234,30 @@ impl SaleValueMode {
 enum RankingMode {
     Profit,
     RecentSales4d,
+    RecentQuantity4d,
 }
 
 impl RankingMode {
     fn label(self) -> &'static str {
         match self {
             RankingMode::Profit => "Profit",
-            RankingMode::RecentSales4d => "Sales in past 4 days",
+            RankingMode::RecentSales4d => "Times sold in past 4 days",
+            RankingMode::RecentQuantity4d => "Quantity sold in past 4 days",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SalesGraphMode {
+    Quantity,
+    Value,
+}
+
+impl SalesGraphMode {
+    fn label(self) -> &'static str {
+        match self {
+            SalesGraphMode::Quantity => "Quantity",
+            SalesGraphMode::Value => "Value",
         }
     }
 }
@@ -1197,15 +1284,17 @@ struct ItemMetadata {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct XivApiCache {
+struct GameDataCache {
     categories: Vec<ItemCategory>,
     item_metadata: HashMap<u32, ItemMetadata>,
     vendor_prices: HashMap<u32, u32>,
     recipe_materials: HashMap<u32, Vec<RecipeMaterial>>,
+    #[serde(default)]
+    gathering_items: Vec<GatheringItemInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct XivApiCacheManifest {
+struct GameDataCacheManifest {
     schema_version: u32,
     relevant_item_count: usize,
     relevant_item_hash: u64,
@@ -1218,23 +1307,67 @@ struct MarketPrice {
     recent_sale_prices: Vec<u32>,
     daily_velocity: f64,
     #[serde(default)]
+    recent_sales_1d: usize,
+    #[serde(default)]
     recent_sales_2d: usize,
     #[serde(default)]
     recent_sales_4d: usize,
+    #[serde(default)]
+    recent_quantity_1d: u32,
+    #[serde(default)]
+    recent_quantity_2d: u32,
+    #[serde(default)]
+    recent_quantity_4d: u32,
+    #[serde(default)]
+    daily_history: Vec<DailySaleBucket>,
     metadata: ItemMetadata,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct SaleHistory {
+    recent_sales_1d: usize,
     recent_sales_2d: usize,
     recent_sales_4d: usize,
+    recent_quantity_1d: u32,
+    recent_quantity_2d: u32,
+    recent_quantity_4d: u32,
     recent_sale_prices: Vec<u32>,
+    daily_history: Vec<DailySaleBucket>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct DailySaleBucket {
+    days_ago: u8,
+    sales: usize,
+    quantity: u32,
+    value: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct RecipeMaterial {
     item_id: u32,
     amount: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct GatheringItemInfo {
+    item_id: u32,
+    item_name: Option<String>,
+    #[serde(default)]
+    locations: Vec<GatheringLocationInfo>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct GatheringLocationInfo {
+    gathering_point_id: Option<u32>,
+    node_type: String,
+    folklore_book: Option<String>,
+    level: Option<u32>,
+    place_id: Option<u32>,
+    place_name: Option<String>,
+    territory_id: Option<u32>,
+    #[serde(default)]
+    timed_windows: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1248,8 +1381,10 @@ struct ProfitRow {
     craft_cost: u32,
     profit: i64,
     daily_velocity: f64,
+    recent_sales_1d: usize,
     recent_sales_2d: usize,
     recent_sales_4d: usize,
+    recent_quantity_4d: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -1257,14 +1392,19 @@ struct GatherRow {
     item_id: u32,
     recipe_id: Option<u32>,
     item_name: String,
-    category_name: Option<String>,
     search_category_id: Option<u32>,
     sell_price: u32,
-    vendor_price: Option<u32>,
     profit: i64,
     daily_velocity: f64,
+    recent_sales_1d: usize,
     recent_sales_2d: usize,
     recent_sales_4d: usize,
+    recent_quantity_1d: u32,
+    recent_quantity_2d: u32,
+    recent_quantity_4d: u32,
+    node_type: String,
+    where_text: String,
+    timed_windows: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1377,21 +1517,16 @@ struct HistoryEntry {
     timestamp: i64,
     #[serde(rename = "pricePerUnit")]
     price_per_unit: u32,
+    #[serde(default = "default_sale_quantity")]
+    quantity: u32,
 }
 
-#[derive(Debug, Deserialize)]
-struct XivSheetRows {
-    rows: Vec<XivRow>,
-}
-
-#[derive(Debug, Deserialize)]
-struct XivRow {
-    row_id: u32,
-    fields: Value,
+fn default_sale_quantity() -> u32 {
+    1
 }
 
 fn fetch_market_snapshot(progress: &dyn Fn(String)) -> Result<MarketSnapshot> {
-    progress("Building HTTP client for Universalis and XIVAPI.".to_string());
+    progress("Building HTTP client for Universalis.".to_string());
     let client = reqwest::blocking::Client::builder()
         .user_agent("FortunaProfitCrafter/0.1")
         .build()?;
@@ -1403,32 +1538,37 @@ fn fetch_market_snapshot(progress: &dyn Fn(String)) -> Result<MarketSnapshot> {
         prices.len()
     ));
     let market_item_ids = sorted_market_item_ids(&prices);
-    let xivapi_cache = load_or_update_xivapi_library(&market_item_ids, progress)?;
+    let game_data_cache = load_game_data_cache_for_market(progress);
     let sales_history = fetch_sales_history(&client, &market_item_ids, progress)?;
 
     progress("Merging item categories, vendor prices, and sale counts.".to_string());
     for (item_id, price) in &mut prices {
-        price.metadata = xivapi_cache
+        price.metadata = game_data_cache
             .item_metadata
             .get(item_id)
             .cloned()
             .unwrap_or_default();
-        if let Some(vendor_price) = xivapi_cache.vendor_prices.get(item_id).copied() {
+        if let Some(vendor_price) = game_data_cache.vendor_prices.get(item_id).copied() {
             price.metadata.vendor_price = Some(vendor_price);
         }
     }
 
     for (item_id, history) in sales_history {
         if let Some(price) = prices.get_mut(&item_id) {
+            price.recent_sales_1d = history.recent_sales_1d;
             price.recent_sales_2d = history.recent_sales_2d;
             price.recent_sales_4d = history.recent_sales_4d;
+            price.recent_quantity_1d = history.recent_quantity_1d;
+            price.recent_quantity_2d = history.recent_quantity_2d;
+            price.recent_quantity_4d = history.recent_quantity_4d;
             price.recent_sale_prices = history.recent_sale_prices;
+            price.daily_history = history.daily_history;
         }
     }
 
     Ok(MarketSnapshot {
         prices,
-        categories: xivapi_cache.categories,
+        categories: game_data_cache.categories,
     })
 }
 
@@ -1473,8 +1613,13 @@ fn market_price_from_result(result: &AggregatedResult) -> Option<MarketPrice> {
         average_sale,
         recent_sale_prices: Vec::new(),
         daily_velocity,
+        recent_sales_1d: 0,
         recent_sales_2d: 0,
         recent_sales_4d: 0,
+        recent_quantity_1d: 0,
+        recent_quantity_2d: 0,
+        recent_quantity_4d: 0,
+        daily_history: Vec::new(),
         metadata: ItemMetadata::default(),
     })
 }
@@ -1543,131 +1688,79 @@ fn sorted_market_item_ids(prices: &HashMap<u32, MarketPrice>) -> Vec<u32> {
     item_ids
 }
 
-fn load_or_update_xivapi_library(
-    item_ids: &[u32],
-    progress: &dyn Fn(String),
-) -> Result<XivApiCache> {
-    let expected_manifest = xivapi_cache_manifest(item_ids);
-    match load_xivapi_library() {
-        Ok((cache, manifest)) if cache_is_usable(&cache, &manifest, &expected_manifest) => {
+fn load_game_data_cache_for_market(progress: &dyn Fn(String)) -> GameDataCache {
+    match load_game_data_cache() {
+        Ok((cache, _)) => {
             progress(format!(
-                "Using cached XIVAPI data: {} item types, {} items, {} vendor prices, {} recipe material lists.",
+                "Using existing SaintCoinach cache: {} item types, {} items, {} vendor prices, {} recipe material lists.",
                 cache.categories.len(),
                 cache.item_metadata.len(),
                 cache.vendor_prices.len(),
                 cache.recipe_materials.len()
             ));
-            Ok(cache)
+            cache
         }
-        _ => {
-            progress(
-                "Local XIVAPI cache is missing, stale, or for an older item set; updating it now."
-                    .to_string(),
-            );
-            update_xivapi_library_with_item_ids(item_ids.to_vec(), progress)
+        Err(err) => {
+            progress(format!(
+                "No SaintCoinach cache loaded for this market refresh: {err:#}. Use Update SaintCoinach cache separately."
+            ));
+            GameDataCache::default()
         }
     }
 }
 
-fn cache_is_usable(
-    cache: &XivApiCache,
-    manifest: &XivApiCacheManifest,
-    expected_manifest: &XivApiCacheManifest,
-) -> bool {
-    !cache.categories.is_empty()
-        && !cache.item_metadata.is_empty()
-        && !cache.vendor_prices.is_empty()
-        && !cache.recipe_materials.is_empty()
-        && manifest.schema_version == expected_manifest.schema_version
-        && manifest.relevant_item_count == expected_manifest.relevant_item_count
-        && manifest.relevant_item_hash == expected_manifest.relevant_item_hash
+fn load_game_data_cache() -> Result<(GameDataCache, GameDataCacheManifest)> {
+    let dir = saintcoinach_cache_dir();
+    let manifest = read_json_file(&dir.join("cache_manifest.json"))?;
+    Ok((load_game_data_cache_files(&dir)?, manifest))
 }
 
-fn load_xivapi_library() -> Result<(XivApiCache, XivApiCacheManifest)> {
-    let dir = xivapi_cache_dir();
-    let manifest = read_json_file(&dir.join("cache_manifest.json"))?;
+fn load_game_data_cache_files(dir: &Path) -> Result<GameDataCache> {
     let categories = read_json_file(&dir.join("item_categories.json"))?;
     let item_metadata = read_json_file(&dir.join("item_metadata.json"))?;
     let vendor_prices = read_json_file(&dir.join("vendor_prices.json"))?;
     let recipe_materials = read_json_file(&dir.join("recipe_materials.json")).unwrap_or_default();
-    Ok((
-        XivApiCache {
-            categories,
-            item_metadata,
-            vendor_prices,
-            recipe_materials,
-        },
-        manifest,
-    ))
-}
-
-fn update_xivapi_library(progress: &dyn Fn(String)) -> Result<XivApiCache> {
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("FortunaProfitCrafter/0.1")
-        .build()?;
-    let ids = relevant_market_item_ids();
-    progress(format!(
-        "Checking Universalis for {} possible market item IDs before refreshing XIVAPI.",
-        ids.len()
-    ));
-    let prices = fetch_universalis_market_prices(&client, &ids, progress)?;
-    let item_ids = sorted_market_item_ids(&prices);
-    progress(format!(
-        "Universalis returned market data for {} items; refreshing XIVAPI for only those.",
-        item_ids.len()
-    ));
-    update_xivapi_library_with_client(&client, item_ids, progress)
-}
-
-fn update_xivapi_library_with_item_ids(
-    item_ids: Vec<u32>,
-    progress: &dyn Fn(String),
-) -> Result<XivApiCache> {
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("FortunaProfitCrafter/0.1")
-        .build()?;
-    update_xivapi_library_with_client(&client, item_ids, progress)
-}
-
-fn update_xivapi_library_with_client(
-    client: &reqwest::blocking::Client,
-    item_ids: Vec<u32>,
-    progress: &dyn Fn(String),
-) -> Result<XivApiCache> {
-    progress(format!(
-        "Fetching XIVAPI metadata for {} Universalis-visible item IDs.",
-        item_ids.len()
-    ));
-    let categories = fetch_xivapi_item_categories(&client, progress)
-        .context("failed to fetch XIVAPI item categories")?;
-    let recipe_materials = fetch_xivapi_recipe_materials(&client, progress)
-        .context("failed to fetch XIVAPI recipe materials")?;
-    let metadata_item_ids = extend_item_ids_with_recipe_materials(item_ids, &recipe_materials);
-    progress(format!(
-        "Fetching item metadata for {} market-visible outputs and materials.",
-        metadata_item_ids.len()
-    ));
-    let item_metadata = fetch_xivapi_item_metadata(&client, &metadata_item_ids, progress)
-        .context("failed to fetch XIVAPI item metadata")?;
-    let vendor_prices = vendor_prices_from_item_metadata(&item_metadata);
-    progress(format!(
-        "Derived relevant NPC vendor prices for {} items and recipe materials for {} crafted outputs.",
-        vendor_prices.len(),
-        recipe_materials.len()
-    ));
-    let cache = XivApiCache {
+    let gathering_items = read_json_file(&dir.join("gathering_items.json")).unwrap_or_default();
+    Ok(GameDataCache {
         categories,
         item_metadata,
         vendor_prices,
         recipe_materials,
-    };
-    progress("Saving XIVAPI cache files.".to_string());
-    save_xivapi_library(&cache, &xivapi_cache_manifest(&metadata_item_ids))?;
+        gathering_items,
+    })
+}
+
+fn refresh_saintcoinach_data(progress: &dyn Fn(String)) -> Result<GameDataCache> {
+    let item_ids = relevant_market_item_ids();
+    progress(format!(
+        "Refreshing SaintCoinach game data for {} known craft and material item IDs.",
+        item_ids.len()
+    ));
+    refresh_saintcoinach_data_with_item_ids(item_ids, progress)
+}
+
+fn refresh_saintcoinach_data_with_item_ids(
+    item_ids: Vec<u32>,
+    progress: &dyn Fn(String),
+) -> Result<GameDataCache> {
+    progress(format!(
+        "Exporting SaintCoinach metadata for {} item IDs.",
+        item_ids.len()
+    ));
+    export_saintcoinach_cache(&item_ids, progress)
+        .context("failed to export SaintCoinach game data")?;
+    let cache = load_game_data_cache_files(&saintcoinach_cache_dir())?;
+    progress(format!(
+        "Derived relevant NPC vendor prices for {} items and recipe materials for {} crafted outputs.",
+        cache.vendor_prices.len(),
+        cache.recipe_materials.len()
+    ));
+    save_game_data_cache(&cache, &game_data_cache_manifest(&item_ids))?;
     Ok(cache)
 }
 
-fn save_xivapi_library(cache: &XivApiCache, manifest: &XivApiCacheManifest) -> Result<()> {
-    let dir = xivapi_cache_dir();
+fn save_game_data_cache(cache: &GameDataCache, manifest: &GameDataCacheManifest) -> Result<()> {
+    let dir = saintcoinach_cache_dir();
     fs::create_dir_all(&dir)?;
     write_json_file(&dir.join("cache_manifest.json"), manifest)?;
     write_json_file(&dir.join("item_categories.json"), &cache.categories)?;
@@ -1678,21 +1771,152 @@ fn save_xivapi_library(cache: &XivApiCache, manifest: &XivApiCacheManifest) -> R
 }
 
 fn load_market_snapshot() -> Result<MarketSnapshot> {
-    read_json_file(&xivapi_cache_dir().join("market_snapshot.json"))
+    read_json_file(&universalis_cache_dir().join("market_snapshot.json"))
 }
 
 fn save_market_snapshot(snapshot: &MarketSnapshot) -> Result<()> {
-    let dir = xivapi_cache_dir();
+    let dir = universalis_cache_dir();
     fs::create_dir_all(&dir)?;
     write_json_file(&dir.join("market_snapshot.json"), snapshot)
 }
 
-fn xivapi_cache_manifest(item_ids: &[u32]) -> XivApiCacheManifest {
+fn export_saintcoinach_cache(item_ids: &[u32], progress: &dyn Fn(String)) -> Result<()> {
+    let root = workspace_root();
+    let saintcoinach_dir = root.join("Source").join("SaintCoinach");
+    if !saintcoinach_dir
+        .join("SaintCoinach")
+        .join("SaintCoinach.csproj")
+        .exists()
+    {
+        return Err(anyhow!(
+            "SaintCoinach is missing. Clone https://github.com/xivapi/SaintCoinach.git into {} first.",
+            saintcoinach_dir.display()
+        ));
+    }
+
+    let exporter_dir = root.join("Source").join("Fortuna.SaintCoinachExporter");
+    if !exporter_dir
+        .join("Fortuna.SaintCoinachExporter.csproj")
+        .exists()
+    {
+        return Err(anyhow!(
+            "SaintCoinach exporter project is missing at {}.",
+            exporter_dir.display()
+        ));
+    }
+
+    ensure_dotnet_sdk_available()?;
+
+    let game_dir = find_ffxiv_game_dir().ok_or_else(|| {
+        anyhow!(
+            "Could not find your FFXIV install. Set FORTUNA_FFXIV_GAME_DIR to the folder containing game\\ffxivgame.ver."
+        )
+    })?;
+
+    let cache_dir = saintcoinach_cache_dir();
+    fs::create_dir_all(&cache_dir)?;
+    let item_ids_path = cache_dir.join("saintcoinach_item_ids.json");
+    write_json_file(&item_ids_path, &item_ids)?;
+
+    progress(format!(
+        "Running SaintCoinach exporter against {}.",
+        game_dir.display()
+    ));
+    let output = Command::new("dotnet")
+        .arg("run")
+        .arg("--project")
+        .arg(&exporter_dir)
+        .arg("--")
+        .arg("--game-path")
+        .arg(&game_dir)
+        .arg("--output-dir")
+        .arg(&cache_dir)
+        .arg("--item-ids-file")
+        .arg(&item_ids_path)
+        .current_dir(&root)
+        .output()
+        .context("failed to launch dotnet for the SaintCoinach exporter")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(anyhow!(
+            "SaintCoinach exporter failed.\nstdout:\n{}\nstderr:\n{}",
+            stdout.trim(),
+            stderr.trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        progress(line.to_string());
+    }
+
+    Ok(())
+}
+
+fn ensure_dotnet_sdk_available() -> Result<()> {
+    let output = Command::new("dotnet")
+        .arg("--list-sdks")
+        .output()
+        .context("failed to launch dotnet. Install the .NET SDK, then restart Fortuna")?;
+
+    if !output.status.success() || String::from_utf8_lossy(&output.stdout).trim().is_empty() {
+        return Err(anyhow!(
+            "No .NET SDK is installed. SaintCoinach export needs the .NET SDK, not just the runtime. Install it with: winget install Microsoft.DotNet.SDK.7"
+        ));
+    }
+
+    Ok(())
+}
+
+fn find_ffxiv_game_dir() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(path) = std::env::var("FORTUNA_FFXIV_GAME_DIR") {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Ok(program_files_x86) = std::env::var("ProgramFiles(x86)") {
+        candidates.push(
+            PathBuf::from(&program_files_x86)
+                .join("SquareEnix")
+                .join("FINAL FANTASY XIV - A Realm Reborn"),
+        );
+        candidates.push(
+            PathBuf::from(program_files_x86)
+                .join("Steam")
+                .join("steamapps")
+                .join("common")
+                .join("FINAL FANTASY XIV Online"),
+        );
+    }
+    if let Ok(program_files) = std::env::var("ProgramFiles") {
+        candidates.push(
+            PathBuf::from(program_files)
+                .join("SquareEnix")
+                .join("FINAL FANTASY XIV - A Realm Reborn"),
+        );
+    }
+    candidates.push(PathBuf::from(
+        r"D:\Steam\steamapps\common\FINAL FANTASY XIV Online",
+    ));
+    candidates.push(PathBuf::from(
+        r"D:\Games\SteamApps\common\FINAL FANTASY XIV Online",
+    ));
+    candidates.push(PathBuf::from(
+        r"D:\SteamLibrary\steamapps\common\FINAL FANTASY XIV Online",
+    ));
+
+    candidates
+        .into_iter()
+        .find(|path| path.join("game").join("ffxivgame.ver").exists())
+}
+
+fn game_data_cache_manifest(item_ids: &[u32]) -> GameDataCacheManifest {
     let mut hasher = DefaultHasher::new();
-    XIVAPI_CACHE_SCHEMA_VERSION.hash(&mut hasher);
+    GAME_DATA_CACHE_SCHEMA_VERSION.hash(&mut hasher);
     item_ids.hash(&mut hasher);
-    XivApiCacheManifest {
-        schema_version: XIVAPI_CACHE_SCHEMA_VERSION,
+    GameDataCacheManifest {
+        schema_version: GAME_DATA_CACHE_SCHEMA_VERSION,
         relevant_item_count: item_ids.len(),
         relevant_item_hash: hasher.finish(),
     }
@@ -1709,197 +1933,12 @@ fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     fs::write(path, data).with_context(|| format!("failed to write {}", path.display()))
 }
 
-fn xivapi_cache_dir() -> PathBuf {
-    workspace_root().join("xivapi-cache")
+fn saintcoinach_cache_dir() -> PathBuf {
+    workspace_root().join("Cache").join("SaintCoinach")
 }
 
-fn fetch_xivapi_item_categories(
-    client: &reqwest::blocking::Client,
-    progress: &dyn Fn(String),
-) -> Result<Vec<ItemCategory>> {
-    progress("Fetching XIVAPI item search categories.".to_string());
-    let url = "https://v2.xivapi.com/api/sheet/ItemSearchCategory?limit=200&fields=Name";
-    let data: XivSheetRows = client.get(url).send()?.error_for_status()?.json()?;
-    let mut categories = data
-        .rows
-        .into_iter()
-        .filter_map(|row| {
-            let name = row.fields.get("Name")?.as_str()?.trim();
-            if name.is_empty() {
-                None
-            } else {
-                Some(ItemCategory {
-                    id: row.row_id,
-                    name: name.to_string(),
-                })
-            }
-        })
-        .collect::<Vec<_>>();
-    categories.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
-    progress(format!("Loaded {} XIVAPI item types.", categories.len()));
-    Ok(categories)
-}
-
-fn fetch_xivapi_item_metadata(
-    client: &reqwest::blocking::Client,
-    item_ids: &[u32],
-    progress: &dyn Fn(String),
-) -> Result<HashMap<u32, ItemMetadata>> {
-    let mut metadata = HashMap::new();
-    let chunks = item_ids.chunks(MAX_MARKET_IDS_PER_REQUEST).len();
-    for (index, chunk) in item_ids.chunks(MAX_MARKET_IDS_PER_REQUEST).enumerate() {
-        progress(format!(
-            "Fetching XIVAPI item metadata ({}/{chunks}).",
-            index + 1
-        ));
-        let rows = chunk
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let url = format!(
-            "https://v2.xivapi.com/api/sheet/Item?rows={rows}&fields=Name,ItemSearchCategory.Name,ItemSearchCategory@as(raw),ItemUICategory.Name,PriceMid"
-        );
-        let data: XivSheetRows = client.get(url).send()?.error_for_status()?.json()?;
-        for row in data.rows {
-            let name = row
-                .fields
-                .get("Name")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(ToOwned::to_owned);
-            let search_category_id = row
-                .fields
-                .get("ItemSearchCategory@as(raw)")
-                .and_then(Value::as_u64)
-                .and_then(|value| u32::try_from(value).ok())
-                .filter(|value| *value != 0);
-            let search_category_name = relationship_name(&row.fields, "ItemSearchCategory");
-            let ui_category_name = relationship_name(&row.fields, "ItemUICategory");
-            let vendor_price = row
-                .fields
-                .get("PriceMid")
-                .and_then(Value::as_u64)
-                .and_then(|value| u32::try_from(value).ok())
-                .filter(|value| *value > 0);
-            metadata.insert(
-                row.row_id,
-                ItemMetadata {
-                    name,
-                    search_category_id,
-                    search_category_name,
-                    ui_category_name,
-                    vendor_price,
-                },
-            );
-        }
-    }
-    progress(format!("Loaded metadata for {} items.", metadata.len()));
-    Ok(metadata)
-}
-
-fn fetch_xivapi_recipe_materials(
-    client: &reqwest::blocking::Client,
-    progress: &dyn Fn(String),
-) -> Result<HashMap<u32, Vec<RecipeMaterial>>> {
-    let recipe_ids = RECIPES
-        .entries()
-        .map(|(recipe_id, _)| recipe_id)
-        .collect::<Vec<_>>();
-    let fields = "ItemResult@as(raw),Ingredient@as(raw),AmountIngredient";
-    let chunks = recipe_ids.chunks(MAX_MARKET_IDS_PER_REQUEST).len();
-    let mut materials_by_output = HashMap::new();
-
-    for (index, chunk) in recipe_ids.chunks(MAX_MARKET_IDS_PER_REQUEST).enumerate() {
-        progress(format!(
-            "Fetching XIVAPI recipe materials ({}/{chunks}).",
-            index + 1
-        ));
-        let rows = chunk
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let url = format!("https://v2.xivapi.com/api/sheet/Recipe?rows={rows}&fields={fields}");
-        let data: XivSheetRows = client.get(url).send()?.error_for_status()?.json()?;
-        for row in data.rows {
-            let Some(output_item_id) = raw_u32(&row.fields, "ItemResult@as(raw)") else {
-                continue;
-            };
-            if output_item_id == 0 {
-                continue;
-            }
-            let ingredient_ids = raw_u32_array(&row.fields, "Ingredient@as(raw)");
-            let amounts = raw_u32_array(&row.fields, "AmountIngredient");
-            let mut materials = Vec::new();
-            for (item_id, amount) in ingredient_ids.into_iter().zip(amounts) {
-                if item_id != 0 && amount != 0 {
-                    materials.push(RecipeMaterial { item_id, amount });
-                }
-            }
-            if !materials.is_empty() {
-                materials_by_output.insert(output_item_id, materials);
-            }
-        }
-    }
-
-    progress(format!(
-        "Loaded XIVAPI recipe materials for {} crafted outputs.",
-        materials_by_output.len()
-    ));
-    Ok(materials_by_output)
-}
-
-fn raw_u32(fields: &Value, key: &str) -> Option<u32> {
-    fields
-        .get(key)
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-}
-
-fn raw_u32_array(fields: &Value, key: &str) -> Vec<u32> {
-    fields
-        .get(key)
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_u64)
-                .filter_map(|value| u32::try_from(value).ok())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn extend_item_ids_with_recipe_materials(
-    mut item_ids: Vec<u32>,
-    recipe_materials: &HashMap<u32, Vec<RecipeMaterial>>,
-) -> Vec<u32> {
-    for (&item_id, materials) in recipe_materials {
-        item_ids.push(item_id);
-        item_ids.extend(materials.iter().map(|material| material.item_id));
-    }
-    item_ids.sort_unstable();
-    item_ids.dedup();
-    item_ids
-}
-
-fn relationship_name(fields: &Value, key: &str) -> Option<String> {
-    fields
-        .get(key)?
-        .get("fields")?
-        .get("Name")?
-        .as_str()
-        .map(ToOwned::to_owned)
-        .filter(|name| !name.trim().is_empty())
-}
-
-fn vendor_prices_from_item_metadata(metadata: &HashMap<u32, ItemMetadata>) -> HashMap<u32, u32> {
-    metadata
-        .iter()
-        .filter_map(|(&item_id, metadata)| metadata.vendor_price.map(|price| (item_id, price)))
-        .collect()
+fn universalis_cache_dir() -> PathBuf {
+    workspace_root().join("Cache").join("Universalis")
 }
 
 fn fetch_sales_history(
@@ -1917,7 +1956,7 @@ fn fetch_sales_history(
             .map(u32::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        let url = format!("https://universalis.app/api/history/{WORLD}/{joined}?entries=100");
+        let url = format!("https://universalis.app/api/history/{WORLD}/{joined}?entries=500");
         let response = client.get(url).send()?.error_for_status()?;
         match response.json::<HistoryResponse>()? {
             HistoryResponse::Single(item) => {
@@ -1943,8 +1982,13 @@ fn sale_history_from_entries(entries: &[HistoryEntry]) -> SaleHistory {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0);
+    let cutoff_1d = now - 86_400;
     let cutoff_2d = now - 172_800;
     let cutoff_4d = now - 345_600;
+    let recent_sales_1d = entries
+        .iter()
+        .filter(|entry| entry.timestamp >= cutoff_1d)
+        .count();
     let recent_sales_2d = entries
         .iter()
         .filter(|entry| entry.timestamp >= cutoff_2d)
@@ -1953,6 +1997,45 @@ fn sale_history_from_entries(entries: &[HistoryEntry]) -> SaleHistory {
         .iter()
         .filter(|entry| entry.timestamp >= cutoff_4d)
         .count();
+    let recent_quantity_1d = entries
+        .iter()
+        .filter(|entry| entry.timestamp >= cutoff_1d)
+        .map(|entry| entry.quantity.max(1))
+        .sum();
+    let recent_quantity_2d = entries
+        .iter()
+        .filter(|entry| entry.timestamp >= cutoff_2d)
+        .map(|entry| entry.quantity.max(1))
+        .sum();
+    let recent_quantity_4d = entries
+        .iter()
+        .filter(|entry| entry.timestamp >= cutoff_4d)
+        .map(|entry| entry.quantity.max(1))
+        .sum();
+    let mut daily_history = (0..7)
+        .rev()
+        .map(|days_ago| DailySaleBucket {
+            days_ago,
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    for entry in entries {
+        let age_seconds = now.saturating_sub(entry.timestamp);
+        if age_seconds < 7 * 86_400 {
+            let days_ago = (age_seconds / 86_400) as u8;
+            if let Some(bucket) = daily_history
+                .iter_mut()
+                .find(|bucket| bucket.days_ago == days_ago)
+            {
+                let quantity = entry.quantity.max(1);
+                bucket.sales += 1;
+                bucket.quantity = bucket.quantity.saturating_add(quantity);
+                bucket.value = bucket.value.saturating_add(
+                    u64::from(entry.price_per_unit).saturating_mul(u64::from(quantity)),
+                );
+            }
+        }
+    }
     let mut sorted_entries = entries.iter().collect::<Vec<_>>();
     sorted_entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     let recent_sale_prices = sorted_entries
@@ -1961,9 +2044,14 @@ fn sale_history_from_entries(entries: &[HistoryEntry]) -> SaleHistory {
         .take(4)
         .collect();
     SaleHistory {
+        recent_sales_1d,
         recent_sales_2d,
         recent_sales_4d,
+        recent_quantity_1d,
+        recent_quantity_2d,
+        recent_quantity_4d,
         recent_sale_prices,
+        daily_history,
     }
 }
 
@@ -1977,7 +2065,8 @@ fn relevant_market_item_ids() -> Vec<u32> {
             }
         }
     }
-    if let Ok((cache, _)) = load_xivapi_library() {
+    if let Ok((cache, _)) = load_game_data_cache() {
+        ids.extend(cache.gathering_items.iter().map(|item| item.item_id));
         for (&item_id, materials) in &cache.recipe_materials {
             ids.insert(item_id);
             for material in materials {
@@ -2035,8 +2124,10 @@ fn rank_profitability(
                 craft_cost,
                 profit: i64::from(sale_basis) - i64::from(craft_cost),
                 daily_velocity: sell.daily_velocity,
+                recent_sales_1d: sell.recent_sales_1d,
                 recent_sales_2d: sell.recent_sales_2d,
                 recent_sales_4d: sell.recent_sales_4d,
+                recent_quantity_4d: sell.recent_quantity_4d,
             })
         })
         .collect::<Vec<_>>();
@@ -2046,6 +2137,7 @@ fn rank_profitability(
 
 fn rank_gathering(
     market_prices: &HashMap<u32, MarketPrice>,
+    gathering_items: &[GatheringItemInfo],
     sale_value_mode: SaleValueMode,
     ranking_mode: RankingMode,
 ) -> Vec<GatherRow> {
@@ -2053,35 +2145,62 @@ fn rank_gathering(
         .entries()
         .map(|(recipe_id, recipe)| (recipe.item_id, recipe_id))
         .collect::<HashMap<_, _>>();
-    let mut rows = market_prices
-        .iter()
-        .filter(|(_, price)| {
-            price
-                .metadata
-                .search_category_name
-                .as_deref()
-                .or(price.metadata.ui_category_name.as_deref())
-                .is_some_and(is_gather_category_name)
-        })
-        .map(|(&item_id, price)| {
-            let sale_basis = sale_value(price, sale_value_mode);
-            let acquisition_cost = 0;
-            GatherRow {
-                item_id,
-                recipe_id: recipe_by_item.get(&item_id).copied(),
-                item_name: item_name(item_id),
-                category_name: price
+    let gather_source = if gathering_items.is_empty() {
+        market_prices
+            .iter()
+            .filter(|(_, price)| {
+                price
                     .metadata
                     .search_category_name
-                    .clone()
-                    .or_else(|| price.metadata.ui_category_name.clone()),
-                search_category_id: price.metadata.search_category_id,
+                    .as_deref()
+                    .or(price.metadata.ui_category_name.as_deref())
+                    .is_some_and(is_gather_category_name)
+            })
+            .map(|(&item_id, price)| GatheringItemInfo {
+                item_id,
+                item_name: price.metadata.name.clone(),
+                locations: Vec::new(),
+            })
+            .collect::<Vec<_>>()
+    } else {
+        gathering_items.to_vec()
+    };
+
+    let mut rows = gather_source
+        .into_iter()
+        .map(|gather_item| {
+            let price = market_prices.get(&gather_item.item_id);
+            let sale_basis = price
+                .map(|price| sale_value(price, sale_value_mode))
+                .unwrap_or(0);
+            let acquisition_cost = 0;
+            let locations = summarize_gathering_locations(&gather_item.locations);
+            GatherRow {
+                item_id: gather_item.item_id,
+                recipe_id: recipe_by_item.get(&gather_item.item_id).copied(),
+                item_name: gather_item
+                    .item_name
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| item_name(gather_item.item_id)),
+                search_category_id: price.and_then(|price| price.metadata.search_category_id),
                 sell_price: sale_basis,
-                vendor_price: price.metadata.vendor_price,
                 profit: i64::from(sale_basis) - i64::from(acquisition_cost),
-                daily_velocity: price.daily_velocity,
-                recent_sales_2d: price.recent_sales_2d,
-                recent_sales_4d: price.recent_sales_4d,
+                daily_velocity: price.map(|price| price.daily_velocity).unwrap_or_default(),
+                recent_sales_1d: price.map(|price| price.recent_sales_1d).unwrap_or_default(),
+                recent_sales_2d: price.map(|price| price.recent_sales_2d).unwrap_or_default(),
+                recent_sales_4d: price.map(|price| price.recent_sales_4d).unwrap_or_default(),
+                recent_quantity_1d: price
+                    .map(|price| price.recent_quantity_1d)
+                    .unwrap_or_default(),
+                recent_quantity_2d: price
+                    .map(|price| price.recent_quantity_2d)
+                    .unwrap_or_default(),
+                recent_quantity_4d: price
+                    .map(|price| price.recent_quantity_4d)
+                    .unwrap_or_default(),
+                node_type: locations.node_type,
+                where_text: locations.where_text,
+                timed_windows: locations.timed_windows,
             }
         })
         .collect::<Vec<_>>();
@@ -2102,6 +2221,11 @@ fn sort_profit_rows(rows: &mut [ProfitRow], ranking_mode: RankingMode) {
             .cmp(&a.recent_sales_4d)
             .then_with(|| b.profit.cmp(&a.profit))
             .then_with(|| b.daily_velocity.total_cmp(&a.daily_velocity)),
+        RankingMode::RecentQuantity4d => b
+            .recent_quantity_4d
+            .cmp(&a.recent_quantity_4d)
+            .then_with(|| b.recent_sales_4d.cmp(&a.recent_sales_4d))
+            .then_with(|| b.profit.cmp(&a.profit)),
     });
 }
 
@@ -2118,7 +2242,60 @@ fn sort_gather_rows(rows: &mut [GatherRow], ranking_mode: RankingMode) {
             .cmp(&a.recent_sales_4d)
             .then_with(|| b.profit.cmp(&a.profit))
             .then_with(|| b.daily_velocity.total_cmp(&a.daily_velocity)),
+        RankingMode::RecentQuantity4d => b
+            .recent_quantity_4d
+            .cmp(&a.recent_quantity_4d)
+            .then_with(|| b.recent_sales_4d.cmp(&a.recent_sales_4d))
+            .then_with(|| b.profit.cmp(&a.profit)),
     });
+}
+
+struct GatheringLocationSummary {
+    node_type: String,
+    where_text: String,
+    timed_windows: Vec<String>,
+}
+
+fn summarize_gathering_locations(locations: &[GatheringLocationInfo]) -> GatheringLocationSummary {
+    let mut node_types = locations
+        .iter()
+        .map(|location| location.node_type.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    node_types.sort();
+    node_types.dedup();
+
+    let mut places = locations
+        .iter()
+        .filter_map(|location| location.place_name.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    places.sort();
+    places.dedup();
+
+    let mut timed_windows = locations
+        .iter()
+        .flat_map(|location| location.timed_windows.iter().cloned())
+        .collect::<Vec<_>>();
+    timed_windows.sort();
+    timed_windows.dedup();
+
+    GatheringLocationSummary {
+        node_type: if node_types.is_empty() {
+            "Unknown node".to_string()
+        } else {
+            node_types.join(", ")
+        },
+        where_text: if places.is_empty() {
+            "Unknown location".to_string()
+        } else {
+            places.join(", ")
+        },
+        timed_windows,
+    }
 }
 
 fn recipe_materials_with_raphael_fallback(
@@ -2329,6 +2506,89 @@ fn item_display_name(
         .unwrap_or_else(|| item_name(item_id))
 }
 
+fn draw_sales_graph(ui: &mut egui::Ui, history: &[DailySaleBucket], mode: SalesGraphMode) {
+    let desired_size = egui::vec2(ui.available_width().max(240.0), 140.0);
+    let (rect, _) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        egui::StrokeKind::Inside,
+    );
+
+    if history.is_empty() {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "No sale history loaded",
+            egui::TextStyle::Small.resolve(ui.style()),
+            ui.visuals().weak_text_color(),
+        );
+        return;
+    }
+
+    let values = history
+        .iter()
+        .map(|bucket| match mode {
+            SalesGraphMode::Quantity => f64::from(bucket.quantity),
+            SalesGraphMode::Value => bucket.value as f64,
+        })
+        .collect::<Vec<_>>();
+    let max_value = values.iter().copied().fold(0.0, f64::max).max(1.0);
+    let plot = rect.shrink2(egui::vec2(10.0, 18.0));
+    let step = if values.len() > 1 {
+        plot.width() / (values.len() - 1) as f32
+    } else {
+        0.0
+    };
+    let points = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let x = plot.left() + step * index as f32;
+            let y = plot.bottom() - ((*value / max_value) as f32 * plot.height());
+            egui::pos2(x, y)
+        })
+        .collect::<Vec<_>>();
+
+    if points.len() > 1 {
+        painter.add(egui::Shape::line(
+            points.clone(),
+            egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
+        ));
+    }
+    for point in points {
+        painter.circle_filled(point, 3.0, ui.visuals().selection.stroke.color);
+    }
+
+    let label = match mode {
+        SalesGraphMode::Quantity => format!("max {} qty/day", max_value.round() as u64),
+        SalesGraphMode::Value => format!("max {} gil/day", max_value.round() as u64),
+    };
+    painter.text(
+        rect.left_top() + egui::vec2(8.0, 6.0),
+        egui::Align2::LEFT_TOP,
+        label,
+        egui::TextStyle::Small.resolve(ui.style()),
+        ui.visuals().weak_text_color(),
+    );
+    painter.text(
+        rect.left_bottom() + egui::vec2(8.0, -4.0),
+        egui::Align2::LEFT_BOTTOM,
+        "6d ago",
+        egui::TextStyle::Small.resolve(ui.style()),
+        ui.visuals().weak_text_color(),
+    );
+    painter.text(
+        rect.right_bottom() + egui::vec2(-8.0, -4.0),
+        egui::Align2::RIGHT_BOTTOM,
+        "today",
+        egui::TextStyle::Small.resolve(ui.style()),
+        ui.visuals().weak_text_color(),
+    );
+}
+
 fn raphael_recipe_materials(recipe: &Recipe) -> Vec<RecipeMaterial> {
     recipe
         .ingredients
@@ -2534,6 +2794,10 @@ fn create_macro_blocks(actions: &[Action]) -> Vec<String> {
 
 fn ensure_repo(path: &Path, url: &str) -> Result<String> {
     if !path.join(".git").exists() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
         log_terminal(&format!("Cloning {url} into {}.", path.display()));
         let output = Command::new("git")
             .arg("clone")

@@ -1,4 +1,11 @@
-raphael-rs/
-Universalis/
+Source/
+Source/raphael-rs/
+Source/Universalis/
+Source/SaintCoinach/
+Source/Fortuna.SaintCoinachExporter/
+Cache/
+Cache/SaintCoinach/
+Cache/Universalis/
+Cache/XIVAPI/
 **/target/
 *.pdb

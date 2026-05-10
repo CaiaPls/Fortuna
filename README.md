@@ -41,10 +41,6 @@ It helps FFXIV crafters and gatherers by:
 - `Cache/Universalis/`
   - Local cache area for Universalis market snapshots.
 
-- `Cache/XIVAPI/`
-  - Legacy cache area from the old XIVAPI implementation.
-  - Current Fortuna code no longer writes SaintCoinach or Universalis data here.
-
 - `Source/Fortuna.SaintCoinachExporter/`
   - Small .NET exporter that reads the local FFXIV install through SaintCoinach and writes Fortuna's JSON cache files.
 
@@ -116,7 +112,6 @@ This workspace is primarily a Rust-based toolchain with local workspace dependen
 
 - `Fortuna/` depends on the local `Source/raphael-rs` workspace crates.
 - `Cache/SaintCoinach/` and `Cache/Universalis/` are local cache directories, not compiled crates.
-- `Cache/XIVAPI/` is legacy data from the previous XIVAPI path and is no longer used for new SaintCoinach exports.
 - External source checkouts live under `Source/`.
 
 If you want to run or extend the app, start with `Fortuna/src/main.rs` and the local `Source/raphael-rs` crates.

@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use eframe::egui;
 use raphael_data::{
-    CrafterStats, Locale, RECIPES, Recipe, get_game_settings, get_initial_quality,
+    CrafterStats, ITEMS, Locale, RECIPES, Recipe, get_game_settings, get_initial_quality,
     get_raw_item_name,
 };
 use raphael_sim::{Action, SimulationState};
@@ -58,6 +58,7 @@ struct ProfitCrafterApp {
     market_prices: HashMap<u32, MarketPrice>,
     rows: Vec<ProfitRow>,
     gather_rows: Vec<GatherRow>,
+    market_rows: Vec<MarketRow>,
     item_categories: Vec<ItemCategory>,
     item_metadata: HashMap<u32, ItemMetadata>,
     vendor_sources: HashMap<u32, Vec<VendorSourceInfo>>,
@@ -77,11 +78,18 @@ struct ProfitCrafterApp {
     applied_only_profitable: bool,
     pending_only_recently_sold: bool,
     applied_only_recently_sold: bool,
+    pending_market_only_npc: bool,
+    applied_market_only_npc: bool,
+    pending_market_hide_craftable: bool,
+    applied_market_hide_craftable: bool,
+    pending_market_hide_gatherable: bool,
+    applied_market_hide_gatherable: bool,
     sale_value_mode: SaleValueMode,
     ranking_mode: RankingMode,
     sales_graph_mode: SalesGraphMode,
     status: String,
     activity_log: VecDeque<String>,
+    activity_progress: Option<ActivityProgress>,
     market_rx: Option<Receiver<WorkMessage<MarketSnapshot>>>,
     solve_rx: Option<Receiver<WorkMessage<SolvedMacro>>>,
     update_rx: Option<Receiver<WorkMessage<String>>>,
@@ -98,58 +106,67 @@ impl Default for ProfitCrafterApp {
             recipe_materials,
             gathering_items,
             mut status,
-        ) =
-            match load_game_data_cache() {
-                Ok((cache, _)) => (
-                    cache.categories,
-                    cache.item_metadata,
-                    cache.vendor_sources,
-                    cache.recipe_materials,
-                    cache.gathering_items,
-                    "Loaded stored SaintCoinach item types and recipe materials.".to_string(),
-                ),
-                Err(_) => (
-                    Vec::new(),
-                    HashMap::new(),
-                    HashMap::new(),
-                    HashMap::new(),
-                    Vec::new(),
-                    "No stored SaintCoinach item types or recipe materials loaded.".to_string(),
-                ),
-            };
-        let (market_prices, rows, gather_rows) = match load_market_snapshot() {
+        ) = match load_game_data_cache() {
+            Ok((cache, _)) => (
+                cache.categories,
+                cache.item_metadata,
+                cache.vendor_sources,
+                cache.recipe_materials,
+                cache.gathering_items,
+                "Loaded stored SaintCoinach item types and recipe materials.".to_string(),
+            ),
+            Err(_) => (
+                Vec::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+                "No stored SaintCoinach item types or recipe materials loaded.".to_string(),
+            ),
+        };
+        let (market_prices, rows, gather_rows, market_rows) = match load_market_snapshot() {
             Ok(snapshot) => {
                 let rows = rank_profitability(
                     &snapshot.prices,
                     &item_metadata,
                     &vendor_sources,
                     &recipe_materials,
-                    SaleValueMode::AverageLastFour,
-                    RankingMode::Profit,
+                    SaleValueMode::LowestLastFour,
+                    RankingMode::RecentSales4d,
                 );
                 let gather_rows = rank_gathering(
                     &snapshot.prices,
                     &gathering_items,
-                    SaleValueMode::AverageLastFour,
-                    RankingMode::Profit,
+                    SaleValueMode::LowestLastFour,
+                    RankingMode::RecentSales4d,
+                );
+                let market_rows = rank_market(
+                    &snapshot.prices,
+                    &item_metadata,
+                    &vendor_sources,
+                    &recipe_materials,
+                    &gathering_items,
+                    SaleValueMode::LowestLastFour,
+                    RankingMode::RecentSales4d,
                 );
                 status = format!(
                     "Loaded stored market snapshot with {} prices. Refresh market when you want current data.",
                     snapshot.prices.len()
                 );
-                (snapshot.prices, rows, gather_rows)
+                (snapshot.prices, rows, gather_rows, market_rows)
             }
-            Err(_) => (HashMap::new(), Vec::new(), Vec::new()),
+            Err(_) => (HashMap::new(), Vec::new(), Vec::new(), Vec::new()),
         };
 
         let mut activity_log = VecDeque::new();
         activity_log.push_back(status.clone());
 
         Self {
-            mode: AppMode::Craft,
+            mode: AppMode::Market,
             market_prices,
             rows,
             gather_rows,
+            market_rows,
             item_categories,
             item_metadata,
             recipe_materials,
@@ -169,11 +186,18 @@ impl Default for ProfitCrafterApp {
             applied_only_profitable: false,
             pending_only_recently_sold: false,
             applied_only_recently_sold: false,
-            sale_value_mode: SaleValueMode::AverageLastFour,
-            ranking_mode: RankingMode::Profit,
+            pending_market_only_npc: false,
+            applied_market_only_npc: false,
+            pending_market_hide_craftable: false,
+            applied_market_hide_craftable: false,
+            pending_market_hide_gatherable: false,
+            applied_market_hide_gatherable: false,
+            sale_value_mode: SaleValueMode::LowestLastFour,
+            ranking_mode: RankingMode::RecentSales4d,
             sales_graph_mode: SalesGraphMode::Quantity,
             status,
             activity_log,
+            activity_progress: None,
             market_rx: None,
             solve_rx: None,
             update_rx: None,
@@ -195,6 +219,7 @@ impl eframe::App for ProfitCrafterApp {
                 ui.separator();
                 ui.label(format!("{DATA_CENTER} / {WORLD}"));
                 ui.separator();
+                ui.selectable_value(&mut self.mode, AppMode::Market, "Market");
                 ui.selectable_value(&mut self.mode, AppMode::Craft, "Craft");
                 ui.selectable_value(&mut self.mode, AppMode::Gather, "Gather");
                 ui.separator();
@@ -262,7 +287,11 @@ impl eframe::App for ProfitCrafterApp {
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let available_height = ui.available_height();
-            let lower_sections_height = if self.solved_macro.is_some() { 420.0 } else { 190.0 };
+            let lower_sections_height = if self.solved_macro.is_some() {
+                (available_height * 0.52).clamp(420.0, 560.0)
+            } else {
+                190.0
+            };
             let main_height = if available_height > 260.0 {
                 (available_height - lower_sections_height).max(260.0)
             } else {
@@ -285,19 +314,29 @@ impl eframe::App for ProfitCrafterApp {
                                     "Market prices: {}",
                                     format_count(self.market_prices.len())
                                 ));
-                                ui.label(format!("Ranked recipes: {}", format_count(self.rows.len())));
+                                ui.label(format!(
+                                    "Ranked recipes: {}",
+                                    format_count(self.rows.len())
+                                ));
                                 ui.label(format!(
                                     "Gathering rows: {}",
                                     format_count(self.gather_rows.len())
                                 ));
+                                ui.label(format!(
+                                    "Market rows: {}",
+                                    format_count(self.market_rows.len())
+                                ));
                             });
 
-                        self.draw_crafter_inputs(&mut columns[1]);
-                        columns[1].separator();
+                        if matches!(self.mode, AppMode::Craft) {
+                            self.draw_crafter_inputs(&mut columns[1]);
+                            columns[1].separator();
+                        }
 
                         match self.mode {
                             AppMode::Craft => self.draw_profit_table(&mut columns[1]),
                             AppMode::Gather => self.draw_gather_table(&mut columns[1]),
+                            AppMode::Market => self.draw_market_table(&mut columns[1]),
                         }
 
                         egui::ScrollArea::vertical()
@@ -311,9 +350,32 @@ impl eframe::App for ProfitCrafterApp {
             );
 
             ui.separator();
-            self.draw_macro_output_section(ui);
+            let activity_height = if self.activity_progress.is_some() {
+                144.0
+            } else {
+                132.0
+            };
+            let lower_available = ui.available_height();
+            let macro_height = if self.solved_macro.is_some() {
+                (lower_available - activity_height - 8.0).max(0.0)
+            } else {
+                32.0
+            };
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), macro_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    self.draw_macro_output_section(ui);
+                },
+            );
             ui.separator();
-            self.draw_activity_terminal(ui);
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), activity_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    self.draw_activity_terminal(ui);
+                },
+            );
         });
     }
 }
@@ -326,6 +388,15 @@ impl ProfitCrafterApp {
         while self.activity_log.len() > 200 {
             self.activity_log.pop_front();
         }
+    }
+
+    fn set_progress(&mut self, progress: ActivityProgress) {
+        self.status = progress.detail.clone();
+        self.activity_progress = Some(progress);
+    }
+
+    fn clear_progress(&mut self) {
+        self.activity_progress = None;
     }
 
     fn rebuild_rankings(&mut self) {
@@ -343,16 +414,26 @@ impl ProfitCrafterApp {
             self.sale_value_mode,
             self.ranking_mode,
         );
+        self.market_rows = rank_market(
+            &self.market_prices,
+            &self.item_metadata,
+            &self.vendor_sources,
+            &self.recipe_materials,
+            &self.gathering_items,
+            self.sale_value_mode,
+            self.ranking_mode,
+        );
     }
 
     fn receive_background_work(&mut self, ctx: &egui::Context) {
         if let Some(rx) = self.market_rx.take() {
             match rx.try_recv() {
                 Ok(WorkMessage::Progress(message)) => {
-                    self.set_status(message);
+                    self.handle_market_progress(message);
                     self.market_rx = Some(rx);
                 }
                 Ok(WorkMessage::Done(Ok(snapshot))) => {
+                    self.clear_progress();
                     if let Err(err) = save_market_snapshot(&snapshot) {
                         self.set_status(format!("Could not save market snapshot: {err:#}"));
                     }
@@ -373,11 +454,13 @@ impl ProfitCrafterApp {
                     self.market_rx = None;
                 }
                 Ok(WorkMessage::Done(Err(err))) => {
+                    self.clear_progress();
                     self.set_status(format!("Market refresh failed: {err:#}"));
                     self.market_rx = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => self.market_rx = Some(rx),
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    self.clear_progress();
                     self.set_status("Market refresh worker stopped unexpectedly.");
                     self.market_rx = None;
                 }
@@ -391,6 +474,7 @@ impl ProfitCrafterApp {
                     self.solve_rx = Some(rx);
                 }
                 Ok(WorkMessage::Done(Ok(solved))) => {
+                    self.clear_progress();
                     self.set_status(format!(
                         "Solved {} craft macros with {} total actions.",
                         solved.plans.len(),
@@ -400,11 +484,13 @@ impl ProfitCrafterApp {
                     self.solve_rx = None;
                 }
                 Ok(WorkMessage::Done(Err(err))) => {
+                    self.clear_progress();
                     self.set_status(format!("Macro solve failed: {err:#}"));
                     self.solve_rx = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => self.solve_rx = Some(rx),
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    self.clear_progress();
                     self.set_status("Macro solver stopped unexpectedly.");
                     self.solve_rx = None;
                 }
@@ -414,10 +500,11 @@ impl ProfitCrafterApp {
         if let Some(rx) = self.update_rx.take() {
             match rx.try_recv() {
                 Ok(WorkMessage::Progress(message)) => {
-                    self.set_status(message);
+                    self.handle_update_progress(message);
                     self.update_rx = Some(rx);
                 }
                 Ok(WorkMessage::Done(Ok(message))) => {
+                    self.clear_progress();
                     if let Ok((cache, _)) = load_game_data_cache() {
                         self.item_categories = cache.categories;
                         self.item_metadata = cache.item_metadata;
@@ -430,11 +517,13 @@ impl ProfitCrafterApp {
                     self.update_rx = None;
                 }
                 Ok(WorkMessage::Done(Err(err))) => {
+                    self.clear_progress();
                     self.set_status(format!("Update failed: {err:#}"));
                     self.update_rx = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => self.update_rx = Some(rx),
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    self.clear_progress();
                     self.set_status("Repository updater stopped unexpectedly.");
                     self.update_rx = None;
                 }
@@ -453,6 +542,18 @@ impl ProfitCrafterApp {
         let (tx, rx) = mpsc::channel();
         self.market_rx = Some(rx);
         self.set_status("Connecting to Universalis for current market data...");
+        let ids = market_lookup_item_ids(market_refresh_preview_item_ids(), &|_| {});
+        let pages = ids.chunks(MAX_MARKET_IDS_PER_REQUEST).len();
+        self.set_progress(ActivityProgress::new(
+            "Universalis refresh",
+            format!(
+                "Checking {} item IDs across {} price page(s).",
+                ids.len(),
+                pages
+            ),
+            0,
+            pages.max(1),
+        ));
         ctx.request_repaint();
         thread::spawn(move || {
             report_progress(&tx, "Preparing market refresh.");
@@ -485,6 +586,13 @@ impl ProfitCrafterApp {
         let (tx, rx) = mpsc::channel();
         self.update_rx = Some(rx);
         self.set_status("Refreshing local SaintCoinach game data...");
+        let item_ids = load_marketable_item_ids().unwrap_or_else(|_| relevant_market_item_ids());
+        self.set_progress(ActivityProgress::new(
+            "SaintCoinach refresh",
+            format!("Preparing metadata export for {} item IDs.", item_ids.len()),
+            0,
+            4,
+        ));
         ctx.request_repaint();
         thread::spawn(move || {
             report_progress(&tx, "Refreshing game data cache from SaintCoinach.");
@@ -502,11 +610,74 @@ impl ProfitCrafterApp {
         });
     }
 
+    fn handle_market_progress(&mut self, message: String) {
+        if let Some((current, total)) =
+            parse_fraction_progress(&message, "Fetching current market prices (")
+        {
+            self.set_progress(ActivityProgress::new(
+                "Universalis prices",
+                format!("Fetching price page {current} of {total}."),
+                current,
+                total,
+            ));
+        } else if let Some((current, total)) =
+            parse_fraction_progress(&message, "Fetching sale history (")
+        {
+            self.set_progress(ActivityProgress::new(
+                "Universalis sales",
+                format!("Fetching sale-history page {current} of {total}."),
+                current,
+                total,
+            ));
+        } else {
+            self.set_status(message);
+        }
+    }
+
+    fn handle_update_progress(&mut self, message: String) {
+        if let Some(item_count) =
+            parse_count_after(&message, "Refreshing SaintCoinach game data for ")
+        {
+            self.set_progress(ActivityProgress::new(
+                "SaintCoinach refresh",
+                format!("Preparing metadata export for {item_count} item IDs."),
+                1,
+                4,
+            ));
+        } else if let Some(item_count) =
+            parse_count_after(&message, "Exporting SaintCoinach metadata for ")
+        {
+            self.set_progress(ActivityProgress::new(
+                "SaintCoinach refresh",
+                format!("Exporting metadata for {item_count} item IDs."),
+                2,
+                4,
+            ));
+        } else if message.starts_with("Running SaintCoinach exporter against ") {
+            self.set_progress(ActivityProgress::new(
+                "SaintCoinach refresh",
+                "Running SaintCoinach exporter.".to_string(),
+                3,
+                4,
+            ));
+        } else if message.starts_with("Derived relevant NPC vendor prices") {
+            self.set_progress(ActivityProgress::new(
+                "SaintCoinach refresh",
+                "Saving refreshed vendor and recipe data.".to_string(),
+                4,
+                4,
+            ));
+        } else {
+            self.set_status(message);
+        }
+    }
+
     fn solve_selected_macro(&mut self, ctx: &egui::Context) {
         if self.selected_recipe_id.is_none() {
             match self.mode {
                 AppMode::Craft => self.select_first_visible_craft(),
                 AppMode::Gather => self.select_first_visible_craftable_gather(),
+                AppMode::Market => self.select_first_visible_market_craft(),
             }
         }
         let Some(recipe_id) = self.selected_recipe_id else {
@@ -576,6 +747,10 @@ impl ProfitCrafterApp {
                         format_count(self.filtered_gather_rows().len())
                     )
                 }
+                AppMode::Market => format!(
+                    "Search matched {} market rows.",
+                    format_count(self.filtered_market_rows().len())
+                ),
             });
         }
         ui.small("Search updates the visible list immediately. Dropdown filters apply only when you click Apply filters.");
@@ -629,6 +804,11 @@ impl ProfitCrafterApp {
             &mut self.pending_only_recently_sold,
             "Only >4 sales in 2 days",
         );
+        if matches!(self.mode, AppMode::Market) {
+            ui.checkbox(&mut self.pending_market_only_npc, "Only NPC-buyable");
+            ui.checkbox(&mut self.pending_market_hide_craftable, "Hide craftable");
+            ui.checkbox(&mut self.pending_market_hide_gatherable, "Hide gatherable");
+        }
 
         ui.separator();
         ui.label("Sale value");
@@ -719,6 +899,12 @@ impl ProfitCrafterApp {
                 .filter(|row| self.pending_gather_filters_match(row))
                 .map(|row| (row.item_id, row.item_name.clone()))
                 .collect::<Vec<_>>(),
+            AppMode::Market => self
+                .market_rows
+                .iter()
+                .filter(|row| self.pending_market_filters_match(row))
+                .map(|row| (row.item_id, row.item_name.clone()))
+                .collect::<Vec<_>>(),
         };
         let needle = self.item_filter_search.trim().to_lowercase();
         if !needle.is_empty() {
@@ -733,7 +919,8 @@ impl ProfitCrafterApp {
         self.item_categories
             .iter()
             .filter(|category| {
-                matches!(self.mode, AppMode::Craft) || is_gather_category_name(&category.name)
+                matches!(self.mode, AppMode::Craft | AppMode::Market)
+                    || is_gather_category_name(&category.name)
             })
             .cloned()
             .collect()
@@ -761,6 +948,9 @@ impl ProfitCrafterApp {
             || self.pending_category_filter != self.applied_category_filter
             || self.pending_only_profitable != self.applied_only_profitable
             || self.pending_only_recently_sold != self.applied_only_recently_sold
+            || self.pending_market_only_npc != self.applied_market_only_npc
+            || self.pending_market_hide_craftable != self.applied_market_hide_craftable
+            || self.pending_market_hide_gatherable != self.applied_market_hide_gatherable
     }
 
     fn apply_filters(&mut self) {
@@ -768,17 +958,22 @@ impl ProfitCrafterApp {
         self.applied_category_filter = self.pending_category_filter;
         self.applied_only_profitable = self.pending_only_profitable;
         self.applied_only_recently_sold = self.pending_only_recently_sold;
+        self.applied_market_only_npc = self.pending_market_only_npc;
+        self.applied_market_hide_craftable = self.pending_market_hide_craftable;
+        self.applied_market_hide_gatherable = self.pending_market_hide_gatherable;
         if matches!(self.mode, AppMode::Craft) {
             self.select_first_visible_craft();
         }
         self.set_status(format!(
-            "Filters applied: {} craft rows, {} gathering rows.",
+            "Filters applied: {} craft rows, {} gathering rows, {} market rows.",
             self.filtered_rows().len(),
-            self.filtered_gather_rows().len()
+            self.filtered_gather_rows().len(),
+            self.filtered_market_rows().len()
         ));
     }
 
     fn clear_filters(&mut self) {
+        self.item_search.clear();
         self.pending_item_filter = None;
         self.applied_item_filter = None;
         self.item_filter_search.clear();
@@ -788,6 +983,15 @@ impl ProfitCrafterApp {
         self.applied_only_profitable = false;
         self.pending_only_recently_sold = false;
         self.applied_only_recently_sold = false;
+        self.pending_market_only_npc = false;
+        self.applied_market_only_npc = false;
+        self.pending_market_hide_craftable = false;
+        self.applied_market_hide_craftable = false;
+        self.pending_market_hide_gatherable = false;
+        self.applied_market_hide_gatherable = false;
+        self.sale_value_mode = SaleValueMode::LowestLastFour;
+        self.ranking_mode = RankingMode::RecentSales4d;
+        self.rebuild_rankings();
         self.set_status("Filters cleared.");
     }
 
@@ -797,6 +1001,7 @@ impl ProfitCrafterApp {
             .iter()
             .map(|row| row.item_id)
             .chain(self.gather_rows.iter().map(|row| row.item_id))
+            .chain(self.market_rows.iter().map(|row| row.item_id))
             .collect::<HashSet<_>>();
         for item_filter in [&mut self.pending_item_filter, &mut self.applied_item_filter] {
             if item_filter.is_some_and(|item_id| !available_items.contains(&item_id)) {
@@ -862,9 +1067,21 @@ impl ProfitCrafterApp {
             }
             ui.label(&self.status);
         });
+        if let Some(progress) = &self.activity_progress {
+            ui.add_sized(
+                egui::vec2(ui.available_width(), 18.0),
+                egui::ProgressBar::new(progress.fraction())
+                    .text(format!("{}: {}", progress.label, progress.detail)),
+            );
+            ui.add_space(4.0);
+        }
         egui::ScrollArea::vertical()
             .stick_to_bottom(true)
-            .max_height(112.0)
+            .max_height(if self.activity_progress.is_some() {
+                88.0
+            } else {
+                112.0
+            })
             .show(ui, |ui| {
                 for entry in &self.activity_log {
                     ui.monospace(entry);
@@ -894,7 +1111,7 @@ impl ProfitCrafterApp {
         egui::ScrollArea::horizontal()
             .id_salt("macro_output_horizontal_scroll")
             .auto_shrink([false, false])
-            .max_height(260.0)
+            .max_height(ui.available_height())
             .show(ui, |ui| {
                 ui.horizontal_top(|ui| {
                     for plan in &solved.plans {
@@ -940,7 +1157,10 @@ impl ProfitCrafterApp {
                                         .desired_width(320.0)
                                         .interactive(false),
                                 );
-                                if ui.button(format!("Copy block {}", format_count(idx + 1))).clicked() {
+                                if ui
+                                    .button(format!("Copy block {}", format_count(idx + 1)))
+                                    .clicked()
+                                {
                                     ui.ctx().copy_text(macro_text.clone());
                                 }
                                 response.on_hover_text("This block is ready to paste into FFXIV.");
@@ -985,6 +1205,21 @@ impl ProfitCrafterApp {
         }
     }
 
+    fn select_market_row(&mut self, row: &MarketRow) {
+        self.selected_item_id = Some(row.item_id);
+        self.selected_recipe_id = row.recipe_id;
+        self.selected_hq_ingredients = [0; 6];
+        self.selected_cost_breakdown = explain_cost(
+            row.item_id,
+            &self.market_prices,
+            &self.item_metadata,
+            &self.vendor_sources,
+            &self.recipe_materials,
+        );
+        self.solved_macro = None;
+        self.set_status(format!("Selected market item: {}", row.item_name));
+    }
+
     fn select_first_visible_craft(&mut self) {
         if let Some(row) = self.filtered_rows().into_iter().next() {
             self.select_craft_row(&row);
@@ -1001,6 +1236,16 @@ impl ProfitCrafterApp {
         }
     }
 
+    fn select_first_visible_market_craft(&mut self) {
+        if let Some(row) = self
+            .filtered_market_rows()
+            .into_iter()
+            .find(|row| row.recipe_id.is_some())
+        {
+            self.select_market_row(&row);
+        }
+    }
+
     fn pending_row_filters_match(&self, row: &ProfitRow) -> bool {
         (!self.pending_only_profitable || row.profit > 0)
             && (!self.pending_only_recently_sold || row.recent_sales_2d > 4)
@@ -1012,6 +1257,19 @@ impl ProfitCrafterApp {
     fn pending_gather_filters_match(&self, row: &GatherRow) -> bool {
         (!self.pending_only_profitable || row.profit > 0)
             && (!self.pending_only_recently_sold || row.recent_sales_2d > 4)
+            && self
+                .pending_category_filter
+                .is_none_or(|category_id| row.search_category_id == Some(category_id))
+    }
+
+    fn pending_market_filters_match(&self, row: &MarketRow) -> bool {
+        (!self.pending_only_profitable || row.profit.is_some_and(|profit| profit > 0))
+            && (!self.pending_only_recently_sold || row.recent_sales_2d > 4)
+            && (!self.pending_market_only_npc || row.npc_price.is_some())
+            && (!self.pending_market_hide_craftable
+                || row.recipe_id.is_none()
+                || row.npc_price.is_some())
+            && (!self.pending_market_hide_gatherable || !row.is_gathered || row.npc_price.is_some())
             && self
                 .pending_category_filter
                 .is_none_or(|category_id| row.search_category_id == Some(category_id))
@@ -1047,7 +1305,10 @@ impl ProfitCrafterApp {
                     });
                     ui.horizontal_wrapped(|ui| {
                         if let Some(price) = self.market_prices.get(&row.item_id) {
-                            ui.label(format!("Avg sale {}", format_gil(average_sale_display(price))));
+                            ui.label(format!(
+                                "Avg sale {}",
+                                format_gil(average_sale_display(price))
+                            ));
                             ui.label(format!("{:.2} sales/day", price.daily_velocity));
                         }
                         ui.label(format!("{} sales/1d", format_count(row.recent_sales_1d)));
@@ -1115,6 +1376,106 @@ impl ProfitCrafterApp {
             });
     }
 
+    fn draw_market_table(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Market items");
+        let rows = self.filtered_market_rows();
+        ui.label(format!(
+            "Showing {} of {} market rows",
+            format_count(rows.len()),
+            format_count(self.market_rows.len())
+        ));
+        if self.market_rows.is_empty() {
+            ui.label("Waiting for Universalis market data.");
+        }
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt("market_results_scroll")
+            .auto_shrink([false, false])
+            .max_height(ui.available_height())
+            .show(ui, |ui| {
+                for (idx, row) in rows.into_iter().take(700).enumerate() {
+                    let selected = self.selected_item_id == Some(row.item_id);
+                    let mut tags = Vec::new();
+                    if row.recipe_id.is_some() {
+                        tags.push("craftable");
+                    }
+                    if row.is_gathered {
+                        tags.push("gatherable");
+                    }
+                    if row.npc_price.is_some() {
+                        tags.push("NPC");
+                    }
+                    let title = if tags.is_empty() {
+                        format!("#{} {}", format_count(idx + 1), row.item_name)
+                    } else {
+                        format!(
+                            "#{} {} ({})",
+                            format_count(idx + 1),
+                            row.item_name,
+                            tags.join(", ")
+                        )
+                    };
+                    if ui.selectable_label(selected, title).clicked() {
+                        self.select_market_row(&row);
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        if let Some(profit) = row.profit {
+                            ui.strong(format!("Profit {}", format_gil_signed(profit)));
+                            ui.label(format!("Sell {}", format_gil(row.sell_price)));
+                            if let Some(cost) = row.acquisition_cost {
+                                ui.label(format!("Cost {}", format_gil(cost)));
+                            }
+                        } else if row.has_market_price && row.recipe_id.is_some() {
+                            ui.strong("Profit n/a");
+                            ui.label(format!("Sell {}", format_gil(row.sell_price)));
+                            ui.label("Cost n/a");
+                        } else if row.has_market_price {
+                            ui.strong(format!("Unit {}", format_gil(row.sell_price)));
+                        } else {
+                            ui.strong("Market n/a");
+                            if let Some(cost) = row.acquisition_cost {
+                                ui.label(format!("Cost {}", format_gil(cost)));
+                            }
+                        }
+                        if let Some(price) = row.npc_price {
+                            ui.label(format!("NPC {}", format_gil(price)));
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        if row.has_market_price {
+                            ui.label(format!("Avg sale {}", format_gil(row.average_sale)));
+                            ui.label(format!("{} sales/1d", format_count(row.recent_sales_1d)));
+                            ui.label(format!("{} sales/2d", format_count(row.recent_sales_2d)));
+                            ui.label(format!("{} sales/4d", format_count(row.recent_sales_4d)));
+                            ui.label(format!("{} qty/4d", format_count(row.recent_quantity_4d)));
+                            ui.label(format!("{:.2}/day", row.daily_velocity));
+                        } else {
+                            ui.label("Avg sale n/a");
+                            ui.label("No Universalis price loaded");
+                        }
+                    });
+                    if let Some(vendor) = row.npc_sources.first() {
+                        ui.small(format!("NPC: {} - {}", vendor.seller, vendor.location));
+                    }
+                    if row.is_gathered {
+                        if let Some(gather) = self
+                            .gather_rows
+                            .iter()
+                            .find(|gather| gather.item_id == row.item_id)
+                        {
+                            ui.small(format!("Node: {}", gather.node_type));
+                            ui.small(format!("Where: {}", gather.where_text));
+                            if !gather.timed_windows.is_empty() {
+                                ui.small(format!("Timed: {}", gather.timed_windows.join(", ")));
+                            }
+                        }
+                    }
+                    ui.small(row.category_name.as_deref().unwrap_or("Unknown"));
+                    ui.separator();
+                }
+            });
+    }
+
     fn filtered_rows(&self) -> Vec<ProfitRow> {
         self.rows
             .iter()
@@ -1155,6 +1516,37 @@ impl ProfitCrafterApp {
             .collect()
     }
 
+    fn filtered_market_rows(&self) -> Vec<MarketRow> {
+        self.market_rows
+            .iter()
+            .filter(|row| self.item_matches_search(&row.item_name))
+            .filter(|row| {
+                self.applied_item_filter
+                    .is_none_or(|item_id| row.item_id == item_id)
+            })
+            .filter(|row| {
+                !self.applied_only_profitable || row.profit.is_some_and(|profit| profit > 0)
+            })
+            .filter(|row| !self.applied_only_recently_sold || row.recent_sales_2d > 4)
+            .filter(|row| !self.applied_market_only_npc || row.npc_price.is_some())
+            .filter(|row| {
+                !self.applied_market_hide_craftable
+                    || row.recipe_id.is_none()
+                    || row.npc_price.is_some()
+            })
+            .filter(|row| {
+                !self.applied_market_hide_gatherable || !row.is_gathered || row.npc_price.is_some()
+            })
+            .filter(|row| {
+                self.applied_category_filter.is_none()
+                    || row
+                        .search_category_id
+                        .is_some_and(|id| Some(id) == self.applied_category_filter)
+            })
+            .cloned()
+            .collect()
+    }
+
     fn item_matches_search(&self, item_name: &str) -> bool {
         let needle = self.item_search.trim();
         needle.is_empty() || item_name.to_lowercase().contains(&needle.to_lowercase())
@@ -1178,7 +1570,10 @@ impl ProfitCrafterApp {
             });
             if let Some(price) = self.market_prices.get(&row.item_id) {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(format!("Avg sale: {}", format_gil(average_sale_display(price))));
+                    ui.label(format!(
+                        "Avg sale: {}",
+                        format_gil(average_sale_display(price))
+                    ));
                     ui.label(format!("{:.2} sales/day", price.daily_velocity));
                     ui.label(format!("{} sales/4d", format_count(row.recent_sales_4d)));
                     ui.label(format!("{} qty/4d", format_count(row.recent_quantity_4d)));
@@ -1191,7 +1586,10 @@ impl ProfitCrafterApp {
             });
             if let Some(price) = self.market_prices.get(&row.item_id) {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(format!("Avg sale: {}", format_gil(average_sale_display(price))));
+                    ui.label(format!(
+                        "Avg sale: {}",
+                        format_gil(average_sale_display(price))
+                    ));
                     ui.label(format!("{:.2} sales/day", price.daily_velocity));
                 });
             }
@@ -1205,6 +1603,29 @@ impl ProfitCrafterApp {
             ui.small(format!("Where: {}", row.where_text));
             if !row.timed_windows.is_empty() {
                 ui.small(format!("Timed: {}", row.timed_windows.join(", ")));
+            }
+        } else if let Some(row) = self.market_rows.iter().find(|row| row.item_id == item_id) {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("Unit: {}", format_gil(row.sell_price)));
+                ui.label(format!("Avg sale: {}", format_gil(row.average_sale)));
+                if let Some(cost) = row.craft_cost {
+                    ui.label(format!("Cost: {}", format_gil(cost)));
+                }
+                if let Some(profit) = row.profit {
+                    ui.label(format!("Profit: {}", format_gil_signed(profit)));
+                }
+                if let Some(price) = row.npc_price {
+                    ui.label(format!("NPC: {}", format_gil(price)));
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("{} sales/1d", format_count(row.recent_sales_1d)));
+                ui.label(format!("{} sales/2d", format_count(row.recent_sales_2d)));
+                ui.label(format!("{} sales/4d", format_count(row.recent_sales_4d)));
+                ui.label(format!("{} qty/4d", format_count(row.recent_quantity_4d)));
+            });
+            for source in &row.npc_sources {
+                ui.small(format!("NPC: {} - {}", source.seller, source.location));
             }
         }
 
@@ -1262,53 +1683,72 @@ impl ProfitCrafterApp {
 
         ui.separator();
         ui.label("Cost tree");
-        egui::ScrollArea::vertical()
-            .max_height(220.0)
+        egui::Grid::new("cost_tree_grid")
+            .striped(true)
+            .num_columns(7)
             .show(ui, |ui| {
-                egui::Grid::new("cost_tree_grid")
-                    .striped(true)
-                    .num_columns(6)
-                    .show(ui, |ui| {
-                        ui.strong("Item");
-                        ui.strong("Qty");
-                        ui.strong("Market");
-                        ui.strong("NPC");
-                        ui.strong("Chosen");
-                        ui.strong("Source");
-                        ui.end_row();
+                ui.strong("Item");
+                ui.strong("Qty");
+                ui.strong("Market");
+                ui.strong("NPC");
+                ui.strong("Crafted");
+                ui.strong("Chosen");
+                ui.strong("Source");
+                ui.end_row();
 
-                        for node in &self.selected_cost_breakdown {
-                            let name = format!("{}{}", "  ".repeat(node.depth), node.name);
-                            let total_cost = node.unit_cost.saturating_mul(node.amount);
-                            if node.depth == 0 {
-                                ui.strong(name);
-                                ui.strong(format!("x{}", format_count(node.amount)));
-                                ui.strong(cost_cell(node.market_unit_cost, node.amount));
-                                ui.strong(cost_cell(node.npc_unit_cost, node.amount));
-                                ui.strong(format_gil(total_cost));
-                                ui.strong(&node.source);
-                            } else {
-                                ui.label(name);
-                                ui.label(format!("x{}", format_count(node.amount)));
-                                ui.label(cost_cell(node.market_unit_cost, node.amount));
-                                ui.label(cost_cell(node.npc_unit_cost, node.amount));
-                                ui.label(format_gil(total_cost));
-                                ui.label(&node.source);
-                            }
-                            ui.end_row();
-                            if !node.npc_sources.is_empty() {
-                                ui.label("");
-                                ui.label("");
-                                ui.label("");
-                                ui.small(node.npc_sources.join("; "));
-                                ui.label("");
-                                ui.label("");
-                                ui.end_row();
-                            }
-                        }
-                    });
+                for node in &self.selected_cost_breakdown {
+                    let total_cost = node.unit_cost.saturating_mul(node.amount);
+                    let name_width = (ui.available_width() * 0.28).clamp(120.0, 220.0);
+                    let name_cell_size = egui::vec2(name_width, ui.spacing().interact_size.y);
+                    if node.depth == 0 {
+                        draw_cost_tree_item_cell(ui, node, name_cell_size, true);
+                        ui.strong(format!("x{}", format_count(node.amount)));
+                        ui.strong(cost_cell(node.market_unit_cost, node.amount));
+                        ui.strong(cost_cell(node.npc_unit_cost, node.amount));
+                        ui.strong(cost_cell(node.craft_unit_cost, node.amount));
+                        ui.strong(format_gil(total_cost));
+                        ui.strong(&node.source);
+                    } else {
+                        draw_cost_tree_item_cell(ui, node, name_cell_size, false);
+                        ui.label(format!("x{}", format_count(node.amount)));
+                        ui.label(cost_cell(node.market_unit_cost, node.amount));
+                        ui.label(cost_cell(node.npc_unit_cost, node.amount));
+                        ui.label(cost_cell(node.craft_unit_cost, node.amount));
+                        ui.label(format_gil(total_cost));
+                        ui.label(&node.source);
+                    }
+                    ui.end_row();
+                }
             });
 
+        if self
+            .selected_cost_breakdown
+            .iter()
+            .any(|node| !node.npc_sources.is_empty())
+        {
+            ui.separator();
+            ui.label("NPC sources");
+            egui::Grid::new("npc_sources_grid")
+                .striped(true)
+                .num_columns(4)
+                .show(ui, |ui| {
+                    ui.strong("Item");
+                    ui.strong("NPC cost");
+                    ui.strong("Purchasable from");
+                    ui.strong("Location");
+                    ui.end_row();
+
+                    for node in &self.selected_cost_breakdown {
+                        for source in &node.npc_sources {
+                            ui.label(&node.name);
+                            ui.label(cost_cell(node.npc_unit_cost, node.amount));
+                            ui.label(&source.seller);
+                            ui.label(&source.location);
+                            ui.end_row();
+                        }
+                    }
+                });
+        }
     }
 }
 
@@ -1316,6 +1756,7 @@ impl ProfitCrafterApp {
 enum AppMode {
     Craft,
     Gather,
+    Market,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1371,6 +1812,34 @@ enum WorkMessage<T> {
     Done(Result<T>),
 }
 
+#[derive(Debug, Clone)]
+struct ActivityProgress {
+    label: String,
+    detail: String,
+    current: usize,
+    total: usize,
+}
+
+impl ActivityProgress {
+    fn new(
+        label: impl Into<String>,
+        detail: impl Into<String>,
+        current: usize,
+        total: usize,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            detail: detail.into(),
+            current,
+            total: total.max(1),
+        }
+    }
+
+    fn fraction(&self) -> f32 {
+        (self.current as f32 / self.total as f32).clamp(0.0, 1.0)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ItemCategory {
     id: u32,
@@ -1383,6 +1852,8 @@ struct ItemMetadata {
     search_category_id: Option<u32>,
     search_category_name: Option<String>,
     ui_category_name: Option<String>,
+    #[serde(default)]
+    is_untradable: bool,
     vendor_price: Option<u32>,
 }
 
@@ -1463,6 +1934,8 @@ struct VendorSourceInfo {
     map_name: Option<String>,
     place_name: Option<String>,
     territory_name: Option<String>,
+    x: Option<f64>,
+    y: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1476,6 +1949,10 @@ struct NpcInfo {
     place_name: Option<String>,
     #[serde(default)]
     territory_name: Option<String>,
+    #[serde(default)]
+    x: Option<f64>,
+    #[serde(default)]
+    y: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1556,6 +2033,29 @@ struct GatherRow {
     timed_windows: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct MarketRow {
+    item_id: u32,
+    recipe_id: Option<u32>,
+    item_name: String,
+    category_name: Option<String>,
+    search_category_id: Option<u32>,
+    has_market_price: bool,
+    sell_price: u32,
+    average_sale: u32,
+    acquisition_cost: Option<u32>,
+    craft_cost: Option<u32>,
+    profit: Option<i64>,
+    npc_price: Option<u32>,
+    npc_sources: Vec<VendorSourceDisplay>,
+    is_gathered: bool,
+    daily_velocity: f64,
+    recent_sales_1d: usize,
+    recent_sales_2d: usize,
+    recent_sales_4d: usize,
+    recent_quantity_4d: u32,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct MarketSnapshot {
     prices: HashMap<u32, MarketPrice>,
@@ -1570,8 +2070,15 @@ struct CostNode {
     unit_cost: u32,
     market_unit_cost: Option<u32>,
     npc_unit_cost: Option<u32>,
-    npc_sources: Vec<String>,
+    craft_unit_cost: Option<u32>,
+    npc_sources: Vec<VendorSourceDisplay>,
     source: String,
+}
+
+#[derive(Debug, Clone)]
+struct VendorSourceDisplay {
+    seller: String,
+    location: String,
 }
 
 #[derive(Debug)]
@@ -1663,7 +2170,7 @@ struct HistoryItem {
     entries: Vec<HistoryEntry>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HistoryEntry {
     timestamp: i64,
@@ -1682,7 +2189,23 @@ fn fetch_market_snapshot(progress: &dyn Fn(String)) -> Result<MarketSnapshot> {
     let client = reqwest::blocking::Client::builder()
         .user_agent("FortunaProfitCrafter/0.1")
         .build()?;
-    let ids = relevant_market_item_ids();
+    let game_data_cache = load_game_data_cache_for_market(progress);
+    let saintcoinach_ids = saintcoinach_market_item_ids_from_cache(&game_data_cache);
+    let ids = if saintcoinach_ids.is_empty() {
+        fetch_marketable_item_ids(&client, progress).unwrap_or_else(|err| {
+            progress(format!(
+                "Could not load full Universalis marketable item list: {err:#}. Falling back to known craft and material IDs."
+            ));
+            relevant_market_item_ids()
+        })
+    } else {
+        progress(format!(
+            "Using {} SaintCoinach market candidate item IDs.",
+            saintcoinach_ids.len()
+        ));
+        saintcoinach_ids
+    };
+    let ids = market_lookup_item_ids(ids, progress);
     progress(format!("Checking {} possible market item IDs.", ids.len()));
     let mut prices = fetch_universalis_market_prices(&client, &ids, progress)?;
     progress(format!(
@@ -1690,7 +2213,6 @@ fn fetch_market_snapshot(progress: &dyn Fn(String)) -> Result<MarketSnapshot> {
         prices.len()
     ));
     let market_item_ids = sorted_market_item_ids(&prices);
-    let game_data_cache = load_game_data_cache_for_market(progress);
     let sales_history = fetch_sales_history(&client, &market_item_ids, progress)?;
 
     progress("Merging item categories, vendor prices, and sale counts.".to_string());
@@ -1839,6 +2361,135 @@ fn fetch_universalis_market_chunk(
     Ok(())
 }
 
+fn fetch_marketable_item_ids(
+    client: &reqwest::blocking::Client,
+    progress: &dyn Fn(String),
+) -> Result<Vec<u32>> {
+    progress("Loading full Universalis marketable item list.".to_string());
+    let response = client
+        .get("https://universalis.app/items")
+        .send()?
+        .error_for_status()?;
+    let html = response.text()?;
+    let ids = parse_marketable_item_ids(&html);
+    if ids.is_empty() {
+        return Err(anyhow!("Universalis returned no marketable item IDs"));
+    }
+    save_marketable_item_ids(&ids, progress);
+    progress(format!(
+        "Loaded {} marketable item IDs from Universalis.",
+        ids.len()
+    ));
+    Ok(ids)
+}
+
+fn parse_marketable_item_ids(html: &str) -> Vec<u32> {
+    let mut ids = html
+        .split("Item ")
+        .skip(1)
+        .filter_map(|part| {
+            let digits = part
+                .chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>();
+            (!digits.is_empty())
+                .then(|| digits.parse::<u32>().ok())
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn load_marketable_item_ids() -> Result<Vec<u32>> {
+    read_json_file(&marketable_item_ids_path())
+}
+
+fn market_lookup_item_ids(ids: Vec<u32>, progress: &dyn Fn(String)) -> Vec<u32> {
+    let before = ids.len();
+    let ids = ids
+        .into_iter()
+        .filter(|&item_id| !is_collectable_item(item_id))
+        .collect::<Vec<_>>();
+    let skipped = before.saturating_sub(ids.len());
+    if skipped > 0 {
+        progress(format!(
+            "Skipping {} collectable item IDs for Universalis lookup.",
+            skipped
+        ));
+    }
+    ids
+}
+
+fn market_refresh_preview_item_ids() -> Vec<u32> {
+    load_game_data_cache()
+        .map(|(cache, _)| saintcoinach_market_item_ids_from_cache(&cache))
+        .ok()
+        .filter(|ids| !ids.is_empty())
+        .or_else(|| load_marketable_item_ids().ok())
+        .unwrap_or_else(relevant_market_item_ids)
+}
+
+fn saintcoinach_market_item_ids_from_cache(cache: &GameDataCache) -> Vec<u32> {
+    let mut ids = cache
+        .item_metadata
+        .iter()
+        .filter_map(|(&item_id, metadata)| {
+            is_saintcoinach_market_candidate(metadata).then_some(item_id)
+        })
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn is_saintcoinach_market_candidate(metadata: &ItemMetadata) -> bool {
+    metadata.search_category_id.is_some() && !metadata.is_untradable
+}
+
+fn is_collectable_item(item_id: u32) -> bool {
+    ITEMS
+        .get(item_id)
+        .is_some_and(|item| item.always_collectable)
+}
+
+fn save_marketable_item_ids(ids: &[u32], progress: &dyn Fn(String)) {
+    if let Some(parent) = marketable_item_ids_path().parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            progress(format!(
+                "Could not create marketable item cache directory: {err:#}"
+            ));
+            return;
+        }
+    }
+    if let Err(err) = write_json_file(&marketable_item_ids_path(), &ids) {
+        progress(format!("Could not save marketable item ID cache: {err:#}"));
+    }
+    if let Err(err) = write_marketable_item_ids_csv(ids) {
+        progress(format!(
+            "Could not save marketable item ID CSV cache: {err:#}"
+        ));
+    }
+}
+
+fn marketable_item_ids_path() -> PathBuf {
+    universalis_cache_dir().join("marketable_item_ids.json")
+}
+
+fn marketable_item_ids_csv_path() -> PathBuf {
+    universalis_cache_dir().join("marketable_item_ids.csv")
+}
+
+fn write_marketable_item_ids_csv(ids: &[u32]) -> Result<()> {
+    let rows = std::iter::once("item_id".to_string())
+        .chain(ids.iter().map(u32::to_string))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(marketable_item_ids_csv_path(), rows)
+        .context("failed to write marketable_item_ids.csv")
+}
+
 fn sorted_market_item_ids(prices: &HashMap<u32, MarketPrice>) -> Vec<u32> {
     let mut item_ids = prices.keys().copied().collect::<Vec<_>>();
     item_ids.sort_unstable();
@@ -1896,12 +2547,33 @@ fn load_game_data_cache_files(dir: &Path) -> Result<GameDataCache> {
 }
 
 fn refresh_saintcoinach_data(progress: &dyn Fn(String)) -> Result<GameDataCache> {
-    let item_ids = relevant_market_item_ids();
+    let item_ids = full_marketable_item_ids_for_metadata(progress);
     progress(format!(
-        "Refreshing SaintCoinach game data for {} known craft and material item IDs.",
+        "Refreshing SaintCoinach game data for {} marketable item IDs.",
         item_ids.len()
     ));
     refresh_saintcoinach_data_with_item_ids(item_ids, progress)
+}
+
+fn full_marketable_item_ids_for_metadata(progress: &dyn Fn(String)) -> Vec<u32> {
+    load_marketable_item_ids().unwrap_or_else(|_| {
+        let client = reqwest::blocking::Client::builder()
+            .user_agent("FortunaProfitCrafter/0.1")
+            .build();
+        match client
+            .ok()
+            .and_then(|client| fetch_marketable_item_ids(&client, progress).ok())
+        {
+            Some(ids) => ids,
+            None => {
+                progress(
+                    "Using known craft and material IDs because the full Universalis item list is unavailable."
+                        .to_string(),
+                );
+                relevant_market_item_ids()
+            }
+        }
+    })
 }
 
 fn refresh_saintcoinach_data_with_item_ids(
@@ -1941,7 +2613,10 @@ fn derive_vendor_sources(
     npcs: &[NpcInfo],
     shops: &[ShopInfo],
 ) -> HashMap<u32, Vec<VendorSourceInfo>> {
-    let npc_by_id = npcs.iter().map(|npc| (npc.id, npc)).collect::<HashMap<_, _>>();
+    let npc_by_id = npcs
+        .iter()
+        .map(|npc| (npc.id, npc))
+        .collect::<HashMap<_, _>>();
     let mut sources: HashMap<u32, Vec<VendorSourceInfo>> = HashMap::new();
 
     for shop in shops {
@@ -2008,6 +2683,8 @@ fn push_vendor_source(
         map_name: npc.map_name.clone(),
         place_name: npc.place_name.clone(),
         territory_name: npc.territory_name.clone(),
+        x: npc.x,
+        y: npc.y,
     });
 }
 
@@ -2089,8 +2766,15 @@ fn export_saintcoinach_cache(item_ids: &[u32], progress: &dyn Fn(String)) -> Res
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
-        progress(line.to_string());
+    let line_count = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    if line_count > 0 {
+        progress(format!(
+            "SaintCoinach exporter completed with {} status line(s).",
+            line_count
+        ));
     }
 
     Ok(())
@@ -2187,35 +2871,161 @@ fn fetch_sales_history(
     ids: &[u32],
     progress: &dyn Fn(String),
 ) -> Result<HashMap<u32, SaleHistory>> {
-    let mut sales = HashMap::new();
+    let mut fetched_entries = HashMap::new();
 
     let chunks = ids.chunks(MAX_MARKET_IDS_PER_REQUEST).len();
     for (index, chunk) in ids.chunks(MAX_MARKET_IDS_PER_REQUEST).enumerate() {
         progress(format!("Fetching sale history ({}/{chunks}).", index + 1));
-        let joined = chunk
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let url = format!("https://universalis.app/api/history/{WORLD}/{joined}?entries=500");
-        let response = client.get(url).send()?.error_for_status()?;
-        match response.json::<HistoryResponse>()? {
-            HistoryResponse::Single(item) => {
-                sales.insert(item.item_id, sale_history_from_entries(&item.entries));
-            }
-            HistoryResponse::Multi { items } => {
-                for item in items {
-                    sales.insert(item.item_id, sale_history_from_entries(&item.entries));
-                }
+        fetch_sales_history_chunk(client, chunk, &mut fetched_entries, progress)?;
+    }
+
+    let mut cached_entries = load_sale_history_entries(progress);
+    let fetched_count = fetched_entries.values().map(Vec::len).sum::<usize>();
+    for (item_id, mut entries) in fetched_entries {
+        cached_entries
+            .entry(item_id)
+            .or_default()
+            .append(&mut entries);
+    }
+    dedupe_sale_history_entries(&mut cached_entries);
+    save_sale_history_entries(&cached_entries, progress);
+
+    let sales = ids
+        .iter()
+        .filter_map(|item_id| {
+            cached_entries
+                .get(item_id)
+                .map(|entries| (*item_id, sale_history_from_entries(entries)))
+        })
+        .collect::<HashMap<_, _>>();
+
+    progress(format!(
+        "Loaded sale history for {} market items; cached {} new entries.",
+        sales.len(),
+        fetched_count
+    ));
+    Ok(sales)
+}
+
+fn fetch_sales_history_chunk(
+    client: &reqwest::blocking::Client,
+    ids: &[u32],
+    entries_by_item: &mut HashMap<u32, Vec<HistoryEntry>>,
+    progress: &dyn Fn(String),
+) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    let joined = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    let url = format!("https://universalis.app/api/history/{WORLD}/{joined}?entries=500");
+    let response = client.get(url).send();
+    let response = match response {
+        Ok(response) => response,
+        Err(err) if ids.len() > 1 && (err.is_timeout() || err.is_connect()) => {
+            progress(format!(
+                "Universalis history request for {} item IDs timed out; splitting the batch.",
+                ids.len()
+            ));
+            let midpoint = ids.len() / 2;
+            fetch_sales_history_chunk(client, &ids[..midpoint], entries_by_item, progress)?;
+            fetch_sales_history_chunk(client, &ids[midpoint..], entries_by_item, progress)?;
+            return Ok(());
+        }
+        Err(err) if ids.len() == 1 && (err.is_timeout() || err.is_connect()) => {
+            progress(format!(
+                "Skipping sale history for item {} after Universalis timed out.",
+                ids[0]
+            ));
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    if response.status().is_server_error()
+        || response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+    {
+        if ids.len() == 1 {
+            progress(format!(
+                "Skipping sale history for item {} after Universalis returned {}.",
+                ids[0],
+                response.status()
+            ));
+            return Ok(());
+        }
+
+        progress(format!(
+            "Universalis returned {} for {} sale-history item IDs; splitting the batch.",
+            response.status(),
+            ids.len()
+        ));
+        let midpoint = ids.len() / 2;
+        fetch_sales_history_chunk(client, &ids[..midpoint], entries_by_item, progress)?;
+        fetch_sales_history_chunk(client, &ids[midpoint..], entries_by_item, progress)?;
+        return Ok(());
+    }
+
+    match response.error_for_status()?.json::<HistoryResponse>()? {
+        HistoryResponse::Single(item) => {
+            entries_by_item.insert(item.item_id, item.entries);
+        }
+        HistoryResponse::Multi { items } => {
+            for item in items {
+                entries_by_item.insert(item.item_id, item.entries);
             }
         }
     }
 
-    progress(format!(
-        "Loaded sale history for {} market items.",
-        sales.len()
-    ));
-    Ok(sales)
+    Ok(())
+}
+
+fn load_sale_history_entries(progress: &dyn Fn(String)) -> HashMap<u32, Vec<HistoryEntry>> {
+    let path = sale_history_entries_path();
+    match read_json_file(&path) {
+        Ok(entries) => {
+            progress("Using cached Universalis sale history.".to_string());
+            entries
+        }
+        Err(_) => HashMap::new(),
+    }
+}
+
+fn save_sale_history_entries(
+    entries_by_item: &HashMap<u32, Vec<HistoryEntry>>,
+    progress: &dyn Fn(String),
+) {
+    if let Some(parent) = sale_history_entries_path().parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            progress(format!(
+                "Could not create sale history cache directory: {err:#}"
+            ));
+            return;
+        }
+    }
+
+    if let Err(err) = write_json_file(&sale_history_entries_path(), entries_by_item) {
+        progress(format!("Could not save sale history cache: {err:#}"));
+    }
+}
+
+fn sale_history_entries_path() -> PathBuf {
+    universalis_cache_dir().join("sale_history_entries.json")
+}
+
+fn dedupe_sale_history_entries(entries_by_item: &mut HashMap<u32, Vec<HistoryEntry>>) {
+    for entries in entries_by_item.values_mut() {
+        entries.sort_by(|a, b| {
+            b.timestamp
+                .cmp(&a.timestamp)
+                .then_with(|| a.price_per_unit.cmp(&b.price_per_unit))
+                .then_with(|| a.quantity.cmp(&b.quantity))
+        });
+        entries.dedup_by(|a, b| {
+            a.timestamp == b.timestamp
+                && a.price_per_unit == b.price_per_unit
+                && a.quantity == b.quantity
+        });
+    }
 }
 
 fn sale_history_from_entries(entries: &[HistoryEntry]) -> SaleHistory {
@@ -2409,7 +3219,11 @@ fn profit_row_is_better(current: &ProfitRow, candidate: &ProfitRow) -> bool {
         .profit
         .cmp(&candidate.profit)
         .then_with(|| candidate.craft_cost.cmp(&current.craft_cost))
-        .then_with(|| current.recent_quantity_4d.cmp(&candidate.recent_quantity_4d))
+        .then_with(|| {
+            current
+                .recent_quantity_4d
+                .cmp(&candidate.recent_quantity_4d)
+        })
         .then_with(|| current.recent_sales_4d.cmp(&candidate.recent_sales_4d))
         .then_with(|| candidate.recipe_id.cmp(&current.recipe_id))
         .is_ge()
@@ -2488,6 +3302,98 @@ fn rank_gathering(
     rows
 }
 
+fn rank_market(
+    market_prices: &HashMap<u32, MarketPrice>,
+    item_metadata: &HashMap<u32, ItemMetadata>,
+    vendor_sources: &HashMap<u32, Vec<VendorSourceInfo>>,
+    xiv_recipe_materials: &HashMap<u32, Vec<RecipeMaterial>>,
+    gathering_items: &[GatheringItemInfo],
+    sale_value_mode: SaleValueMode,
+    ranking_mode: RankingMode,
+) -> Vec<MarketRow> {
+    let recipe_by_item = RECIPES
+        .entries()
+        .map(|(recipe_id, recipe)| (recipe.item_id, recipe_id))
+        .collect::<HashMap<_, _>>();
+    let gathered_items = gathering_items
+        .iter()
+        .map(|item| item.item_id)
+        .collect::<HashSet<_>>();
+    let recipe_materials = recipe_materials_with_raphael_fallback(xiv_recipe_materials);
+    let mut memo = HashMap::new();
+
+    let mut item_ids = market_prices.keys().copied().collect::<HashSet<_>>();
+    item_ids.extend(vendor_sources.keys().copied());
+
+    let mut rows = item_ids
+        .into_iter()
+        .filter(|item_id| !is_collectable_item(*item_id))
+        .filter_map(|item_id| {
+            let price = market_prices.get(&item_id);
+            let has_market_price = price.is_some();
+            let craft_cost = recipe_by_item.get(&item_id).and_then(|_| {
+                craft_only_cost(
+                    item_id,
+                    market_prices,
+                    item_metadata,
+                    vendor_sources,
+                    &recipe_materials,
+                    &mut memo,
+                    &mut HashSet::new(),
+                )
+            });
+            let sell_price = price
+                .map(|price| sale_value(price, sale_value_mode))
+                .unwrap_or_default();
+            let npc_price = vendor_cost(item_id, market_prices, item_metadata, vendor_sources);
+            let acquisition_cost = match (craft_cost, npc_price) {
+                (Some(craft), Some(npc)) => Some(craft.min(npc)),
+                (Some(craft), None) => Some(craft),
+                (None, Some(npc)) => Some(npc),
+                (None, None) => None,
+            };
+            if !has_market_price && acquisition_cost.is_none() {
+                return None;
+            }
+            let metadata = price
+                .map(|price| &price.metadata)
+                .or_else(|| item_metadata.get(&item_id));
+            Some(MarketRow {
+                item_id,
+                recipe_id: recipe_by_item.get(&item_id).copied(),
+                item_name: item_display_name(item_id, market_prices, item_metadata),
+                category_name: metadata.and_then(|metadata| {
+                    metadata
+                        .search_category_name
+                        .clone()
+                        .or_else(|| metadata.ui_category_name.clone())
+                }),
+                search_category_id: metadata.and_then(|metadata| metadata.search_category_id),
+                has_market_price,
+                sell_price,
+                average_sale: price.map(average_sale_display).unwrap_or_default(),
+                acquisition_cost,
+                craft_cost,
+                profit: price
+                    .and(acquisition_cost)
+                    .map(|cost| i64::from(sell_price) - i64::from(cost)),
+                npc_price,
+                npc_sources: vendor_source_rows(item_id, vendor_sources),
+                is_gathered: gathered_items.contains(&item_id),
+                daily_velocity: price.map(|price| price.daily_velocity).unwrap_or_default(),
+                recent_sales_1d: price.map(|price| price.recent_sales_1d).unwrap_or_default(),
+                recent_sales_2d: price.map(|price| price.recent_sales_2d).unwrap_or_default(),
+                recent_sales_4d: price.map(|price| price.recent_sales_4d).unwrap_or_default(),
+                recent_quantity_4d: price
+                    .map(|price| price.recent_quantity_4d)
+                    .unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
+    sort_market_rows(&mut rows, ranking_mode);
+    rows
+}
+
 fn sort_profit_rows(rows: &mut [ProfitRow], ranking_mode: RankingMode) {
     rows.sort_by(|a, b| match ranking_mode {
         RankingMode::Profit => b
@@ -2527,6 +3433,27 @@ fn sort_gather_rows(rows: &mut [GatherRow], ranking_mode: RankingMode) {
             .cmp(&a.recent_quantity_4d)
             .then_with(|| b.recent_sales_4d.cmp(&a.recent_sales_4d))
             .then_with(|| b.profit.cmp(&a.profit)),
+    });
+}
+
+fn sort_market_rows(rows: &mut [MarketRow], ranking_mode: RankingMode) {
+    rows.sort_by(|a, b| match ranking_mode {
+        RankingMode::Profit => b
+            .profit
+            .unwrap_or(i64::MIN)
+            .cmp(&a.profit.unwrap_or(i64::MIN))
+            .then_with(|| b.recent_sales_4d.cmp(&a.recent_sales_4d))
+            .then_with(|| b.daily_velocity.total_cmp(&a.daily_velocity)),
+        RankingMode::RecentSales4d => b
+            .recent_sales_4d
+            .cmp(&a.recent_sales_4d)
+            .then_with(|| b.recent_sales_2d.cmp(&a.recent_sales_2d))
+            .then_with(|| b.daily_velocity.total_cmp(&a.daily_velocity)),
+        RankingMode::RecentQuantity4d => b
+            .recent_quantity_4d
+            .cmp(&a.recent_quantity_4d)
+            .then_with(|| b.recent_sales_4d.cmp(&a.recent_sales_4d))
+            .then_with(|| b.daily_velocity.total_cmp(&a.daily_velocity)),
     });
 }
 
@@ -2661,7 +3588,7 @@ fn craft_only_cost(
         ingredients
             .iter()
             .map(|ingredient| {
-                let unit = cheapest_cost(
+                let unit = craft_component_cost(
                     ingredient.item_id,
                     market_prices,
                     item_metadata,
@@ -2680,7 +3607,7 @@ fn craft_only_cost(
     craft_cost
 }
 
-fn cheapest_cost(
+fn craft_component_cost(
     item_id: u32,
     market_prices: &HashMap<u32, MarketPrice>,
     item_metadata: &HashMap<u32, ItemMetadata>,
@@ -2689,21 +3616,21 @@ fn cheapest_cost(
     memo: &mut HashMap<u32, Option<u32>>,
     visiting: &mut HashSet<u32>,
 ) -> Option<u32> {
-    let buy = buy_cost(item_id, market_prices, item_metadata, vendor_sources);
-    let craft = craft_only_cost(
-        item_id,
-        market_prices,
-        item_metadata,
-        vendor_sources,
-        recipe_materials,
-        memo,
-        visiting,
-    );
-    match (buy, craft) {
-        (Some(buy), Some(craft)) => Some(buy.min(craft)),
-        (Some(buy), None) => Some(buy),
-        (None, Some(craft)) => Some(craft),
-        (None, None) => None,
+    if recipe_materials
+        .get(&item_id)
+        .is_some_and(|ingredients| !ingredients.is_empty())
+    {
+        craft_only_cost(
+            item_id,
+            market_prices,
+            item_metadata,
+            vendor_sources,
+            recipe_materials,
+            memo,
+            visiting,
+        )
+    } else {
+        buy_cost(item_id, market_prices, item_metadata, vendor_sources)
     }
 }
 
@@ -2745,9 +3672,10 @@ fn explain_cost_inner(
     nodes: &mut Vec<CostNode>,
 ) {
     let market = market_cost(item_id, market_prices);
+    let ingredient_market = ingredient_market_cost(item_id, market_prices, recipe_materials);
+    let display_market = ingredient_market.or(market);
     let vendor = vendor_cost(item_id, market_prices, item_metadata, vendor_sources);
-    let vendor_labels = vendor_source_labels(item_id, vendor_sources);
-    let buy = buy_cost(item_id, market_prices, item_metadata, vendor_sources);
+    let vendor_rows = vendor_source_rows(item_id, vendor_sources);
     let craft = craft_only_cost(
         item_id,
         market_prices,
@@ -2758,35 +3686,33 @@ fn explain_cost_inner(
         visiting,
     );
     let ingredients = recipe_materials.get(&item_id).cloned().unwrap_or_default();
-    let (unit_cost, source) = match (buy, craft) {
-        (Some(buy), Some(craft)) if craft < buy => {
-            (
-                craft,
-                format!(
-                    "craft ({})",
-                    price_source_summary(market, vendor, &vendor_labels, Some(craft))
-                ),
-            )
+    let (unit_cost, source) = if craft.is_some() {
+        match (vendor, craft) {
+            (Some(vendor), Some(craft)) if vendor <= craft => (vendor, "NPC".to_string()),
+            (_, Some(craft)) => (craft, "Crafted".to_string()),
+            _ => (0, "Missing".to_string()),
         }
-        (Some(buy), Some(craft)) => {
-            (buy, price_source_summary(market, vendor, &vendor_labels, Some(craft)))
+    } else {
+        match (market, vendor) {
+            (Some(market), Some(vendor)) if vendor <= market => (vendor, "NPC".to_string()),
+            (Some(market), _) => (market, "Market".to_string()),
+            (None, Some(vendor)) => (vendor, "NPC".to_string()),
+            (None, None) => (0, "Missing".to_string()),
         }
-        (Some(buy), None) => (buy, price_source_summary(market, vendor, &vendor_labels, None)),
-        (None, Some(craft)) => (craft, "craft".to_string()),
-        (None, None) => (0, "missing Universalis price".to_string()),
     };
     nodes.push(CostNode {
         depth,
         name: item_display_name(item_id, market_prices, item_metadata),
         amount,
         unit_cost,
-        market_unit_cost: market,
+        market_unit_cost: display_market,
         npc_unit_cost: vendor,
-        npc_sources: vendor_labels,
+        craft_unit_cost: craft,
+        npc_sources: vendor_rows,
         source: source.clone(),
     });
 
-    let should_expand_craft = craft.is_some_and(|craft| craft == unit_cost);
+    let should_expand_craft = source == "Crafted";
     if !ingredients.is_empty() && (depth == 0 || should_expand_craft) {
         for ingredient in ingredients {
             explain_cost_inner(
@@ -2826,13 +3752,32 @@ fn market_cost(item_id: u32, market_prices: &HashMap<u32, MarketPrice>) -> Optio
     market_prices.get(&item_id).map(|price| price.min_listing)
 }
 
+fn ingredient_market_cost(
+    item_id: u32,
+    market_prices: &HashMap<u32, MarketPrice>,
+    recipe_materials: &HashMap<u32, Vec<RecipeMaterial>>,
+) -> Option<u32> {
+    let ingredients = recipe_materials.get(&item_id)?;
+    if ingredients.is_empty() {
+        return None;
+    }
+
+    ingredients
+        .iter()
+        .map(|ingredient| {
+            let unit = market_cost(ingredient.item_id, market_prices)?;
+            Some(unit.saturating_mul(ingredient.amount))
+        })
+        .sum()
+}
+
 fn vendor_cost(
     item_id: u32,
     market_prices: &HashMap<u32, MarketPrice>,
     item_metadata: &HashMap<u32, ItemMetadata>,
     vendor_sources: &HashMap<u32, Vec<VendorSourceInfo>>,
 ) -> Option<u32> {
-    if vendor_source_labels(item_id, vendor_sources).is_empty() {
+    if vendor_source_rows(item_id, vendor_sources).is_empty() {
         return None;
     }
     market_prices
@@ -2843,52 +3788,35 @@ fn vendor_cost(
                 .get(&item_id)
                 .and_then(|metadata| metadata.vendor_price)
         })
+        .or_else(|| vendor_source_unit_cost(item_id, vendor_sources))
         .filter(|&price| is_available_vendor_price(price))
 }
 
-fn price_source_summary(
-    market: Option<u32>,
-    vendor: Option<u32>,
-    vendor_labels: &[String],
-    craft: Option<u32>,
-) -> String {
-    let mut parts = Vec::new();
-    if let Some(market) = market {
-        parts.push(format!("market {}", format_gil(market)));
-    }
-    if let Some(vendor) = vendor {
-        if vendor_labels.is_empty() {
-            parts.push(format!("NPC {}", format_gil(vendor)));
-        } else {
-            parts.push(format!(
-                "NPC {} at {}",
-                format_gil(vendor),
-                vendor_labels.join("; ")
-            ));
-        }
-    }
-    if let Some(craft) = craft {
-        parts.push(format!("craft {}", format_gil(craft)));
-    }
-    if parts.is_empty() {
-        "missing Universalis price".to_string()
-    } else {
-        parts.join(", ")
-    }
-}
-
-fn vendor_source_labels(
+fn vendor_source_unit_cost(
     item_id: u32,
     vendor_sources: &HashMap<u32, Vec<VendorSourceInfo>>,
-) -> Vec<String> {
+) -> Option<u32> {
+    vendor_sources
+        .get(&item_id)?
+        .iter()
+        .filter(|source| is_known_vendor_source(source))
+        .map(|source| source.price)
+        .filter(|&price| is_available_vendor_price(price))
+        .min()
+}
+
+fn vendor_source_rows(
+    item_id: u32,
+    vendor_sources: &HashMap<u32, Vec<VendorSourceInfo>>,
+) -> Vec<VendorSourceDisplay> {
     vendor_sources
         .get(&item_id)
         .map(|sources| {
             sources
                 .iter()
                 .filter(|source| is_known_vendor_source(source))
-                .take(4)
-                .map(vendor_source_label)
+                .take(3)
+                .map(vendor_source_display)
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
@@ -2901,26 +3829,73 @@ fn is_known_vendor_source(source: &VendorSourceInfo) -> bool {
         .is_some_and(|name| !name.trim().is_empty())
 }
 
+fn vendor_source_display(source: &VendorSourceInfo) -> VendorSourceDisplay {
+    VendorSourceDisplay {
+        seller: vendor_source_seller(source),
+        location: vendor_source_location(source),
+    }
+}
+
 fn vendor_source_label(source: &VendorSourceInfo) -> String {
+    let display = vendor_source_display(source);
+    format!("{} - {}", display.seller, display.location)
+}
+
+fn vendor_source_seller(source: &VendorSourceInfo) -> String {
     let npc = source
         .npc_name
         .as_deref()
         .or(source.shop_name.as_deref())
         .unwrap_or("unknown vendor");
-    let mut label = npc.to_string();
-    if let Some(title) = source.npc_title.as_deref().filter(|title| !title.trim().is_empty()) {
-        label.push_str(&format!(" ({title})"));
+    let mut label = title_case_words(npc);
+    if let Some(title) = source
+        .npc_title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+    {
+        label.push_str(&format!(" ({})", title_case_words(title)));
     }
+    label
+}
 
+fn vendor_source_location(source: &VendorSourceInfo) -> String {
     let place = source
         .place_name
         .as_deref()
         .or(source.map_name.as_deref())
         .or(source.territory_name.as_deref());
-    if let Some(place) = place.filter(|place| !place.trim().is_empty()) {
-        label.push_str(&format!(" - {place}"));
+    let mut label = title_case_words(
+        place
+            .filter(|place| !place.trim().is_empty())
+            .unwrap_or("Unknown location"),
+    );
+    if let (Some(x), Some(y)) = (source.x, source.y) {
+        label.push_str(&format!(" ({x:.1}, {y:.1})"));
     }
     label
+}
+
+fn title_case_words(text: &str) -> String {
+    text.split_whitespace()
+        .map(title_case_word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn title_case_word(word: &str) -> String {
+    word.split('-')
+        .map(capitalize_first_char)
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn capitalize_first_char(text: &str) -> String {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+
+    first.to_uppercase().chain(chars).collect::<String>()
 }
 
 fn item_display_name(
@@ -2991,25 +3966,26 @@ fn draw_sales_graph(ui: &mut egui::Ui, history: &[DailySaleBucket], mode: SalesG
             egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
         ));
     }
-    let hovered_index = response
-        .hover_pos()
-        .and_then(|pos| {
-            points
-                .iter()
-                .enumerate()
-                .min_by(|(_, a), (_, b)| {
-                    (a.x - pos.x)
-                        .abs()
-                        .partial_cmp(&(b.x - pos.x).abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|(index, _)| index)
-        });
+    let hovered_index = response.hover_pos().and_then(|pos| {
+        points
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                (a.x - pos.x)
+                    .abs()
+                    .partial_cmp(&(b.x - pos.x).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(index, _)| index)
+    });
 
     if let Some(index) = hovered_index {
         if let Some(point) = points.get(index) {
             painter.line_segment(
-                [egui::pos2(point.x, plot.top()), egui::pos2(point.x, plot.bottom())],
+                [
+                    egui::pos2(point.x, plot.top()),
+                    egui::pos2(point.x, plot.bottom()),
+                ],
                 egui::Stroke::new(1.0, ui.visuals().weak_text_color()),
             );
             painter.circle_filled(*point, 5.0, ui.visuals().selection.stroke.color);
@@ -3052,7 +4028,9 @@ fn draw_sales_graph(ui: &mut egui::Ui, history: &[DailySaleBucket], mode: SalesG
     }
 
     let label = match mode {
-        SalesGraphMode::Quantity => format!("max {} qty/day", format_count(max_value.round() as u64)),
+        SalesGraphMode::Quantity => {
+            format!("max {} qty/day", format_count(max_value.round() as u64))
+        }
         SalesGraphMode::Value => format!("max {} avg/day", format_gil(max_value.round() as u32)),
     };
     painter.text(
@@ -3283,6 +4261,21 @@ fn progress_fraction(value: u16, max_value: u16) -> f32 {
     }
 }
 
+fn parse_fraction_progress(message: &str, prefix: &str) -> Option<(usize, usize)> {
+    let fraction = message.strip_prefix(prefix)?.split(')').next()?;
+    let (current, total) = fraction.split_once('/')?;
+    Some((current.trim().parse().ok()?, total.trim().parse().ok()?))
+}
+
+fn parse_count_after(message: &str, prefix: &str) -> Option<usize> {
+    message
+        .strip_prefix(prefix)?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
 fn create_macro_blocks(actions: &[Action]) -> Vec<String> {
     actions
         .chunks(15)
@@ -3370,6 +4363,76 @@ fn cost_cell(unit_cost: Option<u32>, amount: u32) -> String {
     unit_cost
         .map(|cost| format_gil(cost.saturating_mul(amount)))
         .unwrap_or_else(|| "-".to_string())
+}
+
+fn draw_cost_tree_item_cell(
+    ui: &mut egui::Ui,
+    node: &CostNode,
+    cell_size: egui::Vec2,
+    strong: bool,
+) {
+    const TREE_INDENT_WIDTH: f32 = 18.0;
+    const TREE_MARKER_WIDTH: f32 = 9.0;
+    const TREE_MARKER_GAP: f32 = 1.0;
+
+    let row_height = ui.spacing().interact_size.y;
+    let mut tree_width = 0.0;
+    if node.depth > 0 {
+        let max_tree_width = (cell_size.x - 80.0).max(0.0);
+        let tree_indent = (node.depth as f32 * TREE_INDENT_WIDTH).min(max_tree_width);
+        tree_width = tree_indent + TREE_MARKER_WIDTH + TREE_MARKER_GAP;
+    }
+
+    let label_width = (cell_size.x - tree_width).max(20.0);
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let color = if strong {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().text_color()
+    };
+    let mut layout_job = egui::text::LayoutJob::single_section(
+        node.name.clone(),
+        egui::text::TextFormat::simple(font_id, color),
+    );
+    layout_job.wrap.max_width = label_width;
+    layout_job.halign = egui::Align::Min;
+    layout_job.justify = false;
+
+    let galley = ui.painter().layout_job(layout_job);
+    let desired_height = row_height.max(galley.size().y);
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(cell_size.x, desired_height),
+        egui::Sense::hover(),
+    );
+    let label_pos = egui::pos2(
+        rect.left() + tree_width,
+        rect.top() + ((row_height - galley.size().y).max(0.0) * 0.5),
+    );
+
+    if node.depth > 0 {
+        let marker_left = rect.left() + tree_width - TREE_MARKER_GAP - TREE_MARKER_WIDTH;
+        let marker_right = marker_left + TREE_MARKER_WIDTH;
+        let center_y = rect.top() + row_height * 0.5;
+        let left = marker_left + 1.0;
+        let right = marker_right - 1.0;
+        let tip = egui::pos2(right, center_y);
+        let stroke = egui::Stroke::new(1.0, ui.visuals().weak_text_color());
+        ui.painter().line_segment(
+            [
+                egui::pos2(left, rect.top() + 4.0),
+                egui::pos2(left, center_y),
+            ],
+            stroke,
+        );
+        ui.painter()
+            .line_segment([egui::pos2(left, center_y), tip], stroke);
+        ui.painter()
+            .line_segment([tip, egui::pos2(right - 3.0, center_y - 3.0)], stroke);
+        ui.painter()
+            .line_segment([tip, egui::pos2(right - 3.0, center_y + 3.0)], stroke);
+    }
+
+    ui.painter().galley(label_pos, galley, color);
 }
 
 fn average_sale_display(price: &MarketPrice) -> u32 {

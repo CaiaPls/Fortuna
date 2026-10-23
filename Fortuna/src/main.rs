@@ -19,9 +19,157 @@ use raphael_sim::{Action, SimulationState};
 use raphael_solver::{AtomicFlag, MacroSolver, SolverSettings};
 use serde::{Deserialize, Serialize};
 
-const WORLD: &str = "Phoenix";
-const DATA_CENTER: &str = "Light";
+const DEFAULT_DATA_CENTER: &str = "Light";
+const DEFAULT_WORLD: &str = "Phoenix";
+const LOGICAL_DATA_CENTERS: &[LogicalDataCenter] = &[
+    LogicalDataCenter {
+        name: "Chaos",
+        region: "Europe",
+        worlds: &[
+            "Cerberus",
+            "Louisoix",
+            "Moogle",
+            "Omega",
+            "Phantom",
+            "Ragnarok",
+            "Sagittarius",
+            "Spriggan",
+        ],
+    },
+    LogicalDataCenter {
+        name: "Light",
+        region: "Europe",
+        worlds: &[
+            "Alpha",
+            "Lich",
+            "Odin",
+            "Phoenix",
+            "Raiden",
+            "Shiva",
+            "Twintania",
+            "Zodiark",
+        ],
+    },
+    LogicalDataCenter {
+        name: "Materia",
+        region: "Oceania",
+        worlds: &["Bismarck", "Ravana", "Sephirot", "Sophia", "Zurvan"],
+    },
+    LogicalDataCenter {
+        name: "Aether",
+        region: "North America",
+        worlds: &[
+            "Adamantoise",
+            "Cactuar",
+            "Faerie",
+            "Gilgamesh",
+            "Jenova",
+            "Midgardsormr",
+            "Sargatanas",
+            "Siren",
+        ],
+    },
+    LogicalDataCenter {
+        name: "Crystal",
+        region: "North America",
+        worlds: &[
+            "Balmung",
+            "Brynhildr",
+            "Coeurl",
+            "Diabolos",
+            "Goblin",
+            "Malboro",
+            "Mateus",
+            "Zalera",
+        ],
+    },
+    LogicalDataCenter {
+        name: "Dynamis",
+        region: "North America",
+        worlds: &[
+            "Cuchulainn",
+            "Golem",
+            "Halicarnassus",
+            "Kraken",
+            "Maduin",
+            "Marilith",
+            "Rafflesia",
+            "Seraph",
+        ],
+    },
+    LogicalDataCenter {
+        name: "Primal",
+        region: "North America",
+        worlds: &[
+            "Behemoth",
+            "Excalibur",
+            "Exodus",
+            "Famfrit",
+            "Hyperion",
+            "Lamia",
+            "Leviathan",
+            "Ultros",
+        ],
+    },
+    LogicalDataCenter {
+        name: "Elemental",
+        region: "Japan",
+        worlds: &[
+            "Aegis",
+            "Atomos",
+            "Carbuncle",
+            "Garuda",
+            "Gungnir",
+            "Kujata",
+            "Tonberry",
+            "Typhon",
+        ],
+    },
+    LogicalDataCenter {
+        name: "Gaia",
+        region: "Japan",
+        worlds: &[
+            "Alexander",
+            "Bahamut",
+            "Durandal",
+            "Fenrir",
+            "Ifrit",
+            "Ridill",
+            "Tiamat",
+            "Ultima",
+        ],
+    },
+    LogicalDataCenter {
+        name: "Mana",
+        region: "Japan",
+        worlds: &[
+            "Anima",
+            "Asura",
+            "Chocobo",
+            "Hades",
+            "Ixion",
+            "Masamune",
+            "Pandaemonium",
+            "Titan",
+        ],
+    },
+    LogicalDataCenter {
+        name: "Meteor",
+        region: "Japan",
+        worlds: &[
+            "Belias",
+            "Mandragora",
+            "Ramuh",
+            "Shinryu",
+            "Unicorn",
+            "Valefor",
+            "Yojimbo",
+            "Zeromus",
+        ],
+    },
+];
 const MAX_MARKET_IDS_PER_REQUEST: usize = 100;
+const SALE_HISTORY_RETENTION_DAYS: i64 = 10;
 const GAME_DATA_CACHE_SCHEMA_VERSION: u32 = 6;
 const UNAVAILABLE_VENDOR_PRICE: u32 = 99_999;
 const LODESTONE_BASE_URL: &str = "https://eu.finalfantasyxiv.com";
@@ -37,7 +185,9 @@ fn main() -> eframe::Result {
         .any(|arg| arg == "--refresh-saintcoinach-cache" || arg == "--refresh-game-data-cache")
     {
         let progress = |message: String| log_terminal(&message);
-        match refresh_saintcoinach_data(&progress) {
+        match load_ffxiv_game_dir_setting()
+            .and_then(|game_dir| refresh_saintcoinach_data(game_dir, &progress))
+        {
             Ok(cache) => log_terminal(&format!(
                 "Game data cache ready: {} item types, {} items, {} vendor prices.",
                 cache.categories.len(),
@@ -62,6 +212,9 @@ fn main() -> eframe::Result {
 
 struct ProfitCrafterApp {
     mode: AppMode,
+    selected_data_center: String,
+    selected_world: String,
+    ffxiv_game_dir: Option<PathBuf>,
     market_prices: HashMap<u32, MarketPrice>,
     rows: Vec<ProfitRow>,
     gather_rows: Vec<GatherRow>,
@@ -98,15 +251,50 @@ struct ProfitCrafterApp {
     status: String,
     activity_log: VecDeque<String>,
     activity_progress: Option<ActivityProgress>,
-    market_rx: Option<Receiver<WorkMessage<MarketSnapshot>>>,
+    market_rx: Option<Receiver<WorkMessage<(ServerSelection, MarketSnapshot)>>>,
     solve_rx: Option<Receiver<WorkMessage<SolvedMacro>>>,
     update_rx: Option<Receiver<WorkMessage<String>>>,
     solved_macro: Option<SolvedMacro>,
     crafter_stats: CrafterStats,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LogicalDataCenter {
+    name: &'static str,
+    region: &'static str,
+    worlds: &'static [&'static str],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ServerSelection {
+    data_center: &'static str,
+    world: &'static str,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SavedServerSelection {
+    data_center: String,
+    world: String,
+}
+
 impl Default for ProfitCrafterApp {
     fn default() -> Self {
+        let (server_selection, selection_warning) = match load_server_selection() {
+            Ok(selection) => (selection, None),
+            Err(err) => (
+                default_server_selection(),
+                Some(format!("Could not load saved server selection: {err:#}")),
+            ),
+        };
+        let (ffxiv_game_dir, game_dir_warning) = match load_ffxiv_game_dir_setting() {
+            Ok(game_dir) => (game_dir, None),
+            Err(err) => (
+                find_ffxiv_game_dir(),
+                Some(format!(
+                    "Could not load saved FFXIV install folder: {err:#}"
+                )),
+            ),
+        };
         let (
             item_categories,
             item_metadata,
@@ -135,46 +323,66 @@ impl Default for ProfitCrafterApp {
                 "No stored SaintCoinach item types or recipe materials loaded.".to_string(),
             ),
         };
-        let (market_prices, rows, gather_rows, market_rows) = match load_market_snapshot() {
-            Ok(snapshot) => {
-                let rows = rank_profitability(
-                    &snapshot.prices,
-                    &item_metadata,
-                    &vendor_sources,
-                    &recipe_materials,
-                    &gathering_items,
-                    SaleValueMode::LowestLastFour,
-                    RankingMode::RecentSales4d,
-                );
-                let gather_rows = rank_gathering(
-                    &snapshot.prices,
-                    &gathering_items,
-                    SaleValueMode::LowestLastFour,
-                    RankingMode::RecentSales4d,
-                );
-                let market_rows = rank_market(
-                    &snapshot.prices,
-                    &item_metadata,
-                    &vendor_sources,
-                    &recipe_materials,
-                    &gathering_items,
-                    SaleValueMode::LowestLastFour,
-                    RankingMode::RecentSales4d,
-                );
-                status = format!(
-                    "Loaded stored market snapshot with {} prices. Refresh market when you want current data.",
-                    snapshot.prices.len()
-                );
-                (snapshot.prices, rows, gather_rows, market_rows)
-            }
-            Err(_) => (HashMap::new(), Vec::new(), Vec::new(), Vec::new()),
-        };
+        let (market_prices, rows, gather_rows, market_rows) =
+            match load_market_snapshot(&server_selection) {
+                Ok(snapshot) => {
+                    let rows = rank_profitability(
+                        &snapshot.prices,
+                        &item_metadata,
+                        &vendor_sources,
+                        &recipe_materials,
+                        &gathering_items,
+                        SaleValueMode::LowestLastFour,
+                        RankingMode::RecentSales4d,
+                    );
+                    let gather_rows = rank_gathering(
+                        &snapshot.prices,
+                        &gathering_items,
+                        SaleValueMode::LowestLastFour,
+                        RankingMode::RecentSales4d,
+                    );
+                    let market_rows = rank_market(
+                        &snapshot.prices,
+                        &item_metadata,
+                        &vendor_sources,
+                        &recipe_materials,
+                        &gathering_items,
+                        SaleValueMode::LowestLastFour,
+                        RankingMode::RecentSales4d,
+                    );
+                    status = format!(
+                        "Loaded stored {} / {} market snapshot with {} prices. Last Refreshed: {}.",
+                        server_selection.data_center,
+                        server_selection.world,
+                        snapshot.prices.len(),
+                        format_market_refresh_time(snapshot.refreshed_at)
+                    );
+                    (snapshot.prices, rows, gather_rows, market_rows)
+                }
+                Err(_) => (HashMap::new(), Vec::new(), Vec::new(), Vec::new()),
+            };
+        let mut warnings = Vec::new();
+        if let Some(warning) = selection_warning {
+            warnings.push(format!(
+                "{warning} Using {} / {}.",
+                server_selection.data_center, server_selection.world
+            ));
+        }
+        if let Some(warning) = game_dir_warning {
+            warnings.push(warning);
+        }
+        if !warnings.is_empty() {
+            status = format!("{status} {}", warnings.join(" "));
+        }
 
         let mut activity_log = VecDeque::new();
         activity_log.push_back(status.clone());
 
         Self {
             mode: AppMode::Market,
+            selected_data_center: server_selection.data_center.to_string(),
+            selected_world: server_selection.world.to_string(),
+            ffxiv_game_dir,
             market_prices,
             rows,
             gather_rows,
@@ -231,7 +439,48 @@ impl eframe::App for ProfitCrafterApp {
                 let is_busy = self.is_busy();
                 ui.heading("Fortuna Profit Crafter");
                 ui.separator();
-                ui.label(format!("{DATA_CENTER} / {WORLD}"));
+                let mut server_selection_changed = false;
+                ui.add_enabled_ui(!is_busy, |ui| {
+                    ui.label("Data center");
+                    egui::ComboBox::from_id_salt("logical_data_center")
+                        .selected_text(&self.selected_data_center)
+                        .show_ui(ui, |ui| {
+                            for data_center in LOGICAL_DATA_CENTERS {
+                                if ui
+                                    .selectable_value(
+                                        &mut self.selected_data_center,
+                                        data_center.name.to_string(),
+                                        format!("{} ({})", data_center.name, data_center.region),
+                                    )
+                                    .changed()
+                                {
+                                    self.selected_world = data_center.worlds[0].to_string();
+                                    server_selection_changed = true;
+                                }
+                            }
+                        });
+                    ui.label("World");
+                    egui::ComboBox::from_id_salt("world")
+                        .selected_text(&self.selected_world)
+                        .show_ui(ui, |ui| {
+                            if let Some(data_center) =
+                                logical_data_center(&self.selected_data_center)
+                            {
+                                for &world in data_center.worlds {
+                                    server_selection_changed |= ui
+                                        .selectable_value(
+                                            &mut self.selected_world,
+                                            world.to_string(),
+                                            world,
+                                        )
+                                        .changed();
+                                }
+                            }
+                        });
+                });
+                if server_selection_changed {
+                    self.load_selected_server_data();
+                }
                 ui.separator();
                 ui.selectable_value(&mut self.mode, AppMode::Market, "Market");
                 ui.selectable_value(&mut self.mode, AppMode::Craft, "Craft");
@@ -255,6 +504,32 @@ impl eframe::App for ProfitCrafterApp {
                     .clicked()
                 {
                     self.refresh_lodestone_drops(&ctx);
+                }
+                if ui
+                    .add_enabled(!is_busy, egui::Button::new("Choose FFXIV Folder"))
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .set_title("Select the FFXIV installation folder")
+                        .pick_folder()
+                {
+                    if !is_ffxiv_game_dir(&path) {
+                        self.set_status(
+                            "Selected folder is not a valid FFXIV install. Choose the folder containing game\\ffxivgame.ver.",
+                        );
+                    } else {
+                        match save_ffxiv_game_dir(&path) {
+                            Ok(()) => {
+                                self.ffxiv_game_dir = Some(path.clone());
+                                self.set_status(format!(
+                                    "FFXIV install folder set to {}.",
+                                    path.display()
+                                ));
+                            }
+                            Err(err) => self.set_status(format!(
+                                "Could not save FFXIV install folder: {err:#}"
+                            )),
+                        }
+                    }
                 }
                 ui.separator();
                 ui.label("Repos:");
@@ -449,6 +724,49 @@ impl ProfitCrafterApp {
         );
     }
 
+    fn load_selected_server_data(&mut self) {
+        let Some(selection) =
+            find_server_selection(&self.selected_data_center, &self.selected_world)
+        else {
+            self.set_status("Selected logical data center and world combination is invalid.");
+            return;
+        };
+        self.selected_item_id = None;
+        self.selected_recipe_id = None;
+        self.selected_cost_breakdown.clear();
+        self.solved_macro = None;
+        let selection_save_error = save_server_selection(selection)
+            .err()
+            .map(|err| format!("Could not save server selection: {err:#}"));
+        match load_market_snapshot(&selection) {
+            Ok(snapshot) => {
+                self.market_prices = snapshot.prices;
+                self.item_categories = snapshot.categories;
+                self.rebuild_rankings();
+                self.clear_unavailable_filters();
+                self.set_status(format!(
+                    "Loaded {} / {} market data: {} item prices.",
+                    selection.data_center,
+                    selection.world,
+                    self.market_prices.len()
+                ));
+            }
+            Err(err) => {
+                self.market_prices.clear();
+                self.item_categories.clear();
+                self.rebuild_rankings();
+                self.clear_unavailable_filters();
+                self.set_status(format!(
+                    "No market data saved for {} / {} yet ({err:#}). Refresh market to load it.",
+                    selection.data_center, selection.world
+                ));
+            }
+        }
+        if let Some(error) = selection_save_error {
+            self.set_status(format!("{} {error}", self.status));
+        }
+    }
+
     fn receive_background_work(&mut self, ctx: &egui::Context) {
         if let Some(rx) = self.market_rx.take() {
             match rx.try_recv() {
@@ -456,26 +774,35 @@ impl ProfitCrafterApp {
                     self.handle_market_progress(message);
                     self.market_rx = Some(rx);
                 }
-                Ok(WorkMessage::Done(Ok(snapshot))) => {
+                Ok(WorkMessage::Done(Ok((selection, snapshot)))) => {
                     self.clear_progress();
-                    if let Err(err) = save_market_snapshot(&snapshot) {
-                        self.set_status(format!("Could not save market snapshot: {err:#}"));
+                    let save_error = save_market_snapshot(&selection, &snapshot)
+                        .err()
+                        .map(|err| format!("Could not save market snapshot: {err:#}"));
+                    if self.selected_data_center == selection.data_center
+                        && self.selected_world == selection.world
+                    {
+                        self.item_categories = snapshot.categories;
+                        self.market_prices = snapshot.prices;
+                        if let Ok((cache, _)) = load_game_data_cache() {
+                            self.recipe_materials = cache.recipe_materials;
+                            self.item_metadata = cache.item_metadata;
+                            self.vendor_sources = cache.vendor_sources;
+                            self.drop_sources = cache.drop_sources;
+                            self.gathering_items = cache.gathering_items;
+                        }
+                        self.rebuild_rankings();
+                        self.clear_unavailable_filters();
+                        self.set_status(format!(
+                            "Loaded {} prices for {} / {} with SaintCoinach item types, NPC vendor prices, and recent sale counts.",
+                            self.market_prices.len(),
+                            selection.data_center,
+                            selection.world
+                        ));
                     }
-                    self.item_categories = snapshot.categories;
-                    self.market_prices = snapshot.prices;
-                    if let Ok((cache, _)) = load_game_data_cache() {
-                        self.recipe_materials = cache.recipe_materials;
-                        self.item_metadata = cache.item_metadata;
-                        self.vendor_sources = cache.vendor_sources;
-                        self.drop_sources = cache.drop_sources;
-                        self.gathering_items = cache.gathering_items;
+                    if let Some(error) = save_error {
+                        self.set_status(error);
                     }
-                    self.rebuild_rankings();
-                    self.clear_unavailable_filters();
-                    self.set_status(format!(
-                        "Loaded {} prices, SaintCoinach item types, NPC vendor prices, and recent sale counts.",
-                        self.market_prices.len()
-                    ));
                     self.market_rx = None;
                 }
                 Ok(WorkMessage::Done(Err(err))) => {
@@ -565,6 +892,12 @@ impl ProfitCrafterApp {
         if self.market_rx.is_some() {
             return;
         }
+        let Some(server_selection) =
+            find_server_selection(&self.selected_data_center, &self.selected_world)
+        else {
+            self.set_status("Select a valid logical data center and world first.");
+            return;
+        };
         let (tx, rx) = mpsc::channel();
         self.market_rx = Some(rx);
         self.set_status("Connecting to Universalis for current market data...");
@@ -584,7 +917,8 @@ impl ProfitCrafterApp {
         thread::spawn(move || {
             report_progress(&tx, "Preparing market refresh.");
             let progress = |message| report_progress(&tx, message);
-            let result = fetch_market_snapshot(&progress);
+            let result = fetch_market_snapshot(server_selection, &progress)
+                .map(|snapshot| (server_selection, snapshot));
             let _ = tx.send(WorkMessage::Done(result));
         });
     }
@@ -620,10 +954,11 @@ impl ProfitCrafterApp {
             4,
         ));
         ctx.request_repaint();
+        let game_dir = self.ffxiv_game_dir.clone();
         thread::spawn(move || {
             report_progress(&tx, "Refreshing game data cache from SaintCoinach.");
             let progress = |message| report_progress(&tx, message);
-            let result = refresh_saintcoinach_data(&progress).map(|cache| {
+            let result = refresh_saintcoinach_data(game_dir, &progress).map(|cache| {
                 format!(
                     "Game data cache updated: {} item types, {} items, {} NPC gil prices, {} recipe material lists.",
                     cache.categories.len(),
@@ -2222,6 +2557,8 @@ struct MarketRow {
 struct MarketSnapshot {
     prices: HashMap<u32, MarketPrice>,
     categories: Vec<ItemCategory>,
+    #[serde(default)]
+    refreshed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -2346,7 +2683,10 @@ fn default_sale_quantity() -> u32 {
     1
 }
 
-fn fetch_market_snapshot(progress: &dyn Fn(String)) -> Result<MarketSnapshot> {
+fn fetch_market_snapshot(
+    selection: ServerSelection,
+    progress: &dyn Fn(String),
+) -> Result<MarketSnapshot> {
     progress("Building HTTP client for Universalis.".to_string());
     let client = reqwest::blocking::Client::builder()
         .user_agent("FortunaProfitCrafter/0.1")
@@ -2369,13 +2709,13 @@ fn fetch_market_snapshot(progress: &dyn Fn(String)) -> Result<MarketSnapshot> {
     };
     let ids = market_lookup_item_ids(ids, progress);
     progress(format!("Checking {} possible market item IDs.", ids.len()));
-    let mut prices = fetch_universalis_market_prices(&client, &ids, progress)?;
+    let mut prices = fetch_universalis_market_prices(&client, selection.world, &ids, progress)?;
     progress(format!(
         "Loaded current prices for {} market items.",
         prices.len()
     ));
     let market_item_ids = sorted_market_item_ids(&prices);
-    let sales_history = fetch_sales_history(&client, &market_item_ids, progress)?;
+    let sales_history = fetch_sales_history(&client, selection, &market_item_ids, progress)?;
 
     progress("Merging item categories, vendor prices, and sale counts.".to_string());
     for (item_id, price) in &mut prices {
@@ -2410,7 +2750,22 @@ fn fetch_market_snapshot(progress: &dyn Fn(String)) -> Result<MarketSnapshot> {
     Ok(MarketSnapshot {
         prices,
         categories: game_data_cache.categories,
+        refreshed_at: Some(unix_timestamp_now()),
     })
+}
+
+fn unix_timestamp_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn format_market_refresh_time(timestamp: Option<i64>) -> String {
+    timestamp
+        .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0))
+        .map(|datetime| datetime.format("%d-%m-%Y %H:%M UTC").to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn market_price_from_result(result: &AggregatedResult) -> Option<MarketPrice> {
@@ -2467,6 +2822,7 @@ fn market_price_from_result(result: &AggregatedResult) -> Option<MarketPrice> {
 
 fn fetch_universalis_market_prices(
     client: &reqwest::blocking::Client,
+    world: &str,
     ids: &[u32],
     progress: &dyn Fn(String),
 ) -> Result<HashMap<u32, MarketPrice>> {
@@ -2477,13 +2833,14 @@ fn fetch_universalis_market_prices(
             "Fetching current market prices ({}/{market_chunks}).",
             index + 1
         ));
-        fetch_universalis_market_chunk(client, chunk, &mut prices, progress)?;
+        fetch_universalis_market_chunk(client, world, chunk, &mut prices, progress)?;
     }
     Ok(prices)
 }
 
 fn fetch_universalis_market_chunk(
     client: &reqwest::blocking::Client,
+    world: &str,
     ids: &[u32],
     prices: &mut HashMap<u32, MarketPrice>,
     progress: &dyn Fn(String),
@@ -2493,7 +2850,7 @@ fn fetch_universalis_market_chunk(
     }
 
     let joined = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-    let url = format!("https://universalis.app/api/v2/aggregated/{WORLD}/{joined}");
+    let url = format!("https://universalis.app/api/v2/aggregated/{world}/{joined}");
     let response = client.get(url).send()?;
     if response.status() == reqwest::StatusCode::BAD_REQUEST {
         if ids.len() == 1 {
@@ -2509,8 +2866,8 @@ fn fetch_universalis_market_chunk(
             "Universalis rejected a batch of {} item IDs; splitting it to find valid items.",
             ids.len()
         ));
-        fetch_universalis_market_chunk(client, &ids[..midpoint], prices, progress)?;
-        fetch_universalis_market_chunk(client, &ids[midpoint..], prices, progress)?;
+        fetch_universalis_market_chunk(client, world, &ids[..midpoint], prices, progress)?;
+        fetch_universalis_market_chunk(client, world, &ids[midpoint..], prices, progress)?;
         return Ok(());
     }
 
@@ -2710,13 +3067,16 @@ fn load_game_data_cache_files(dir: &Path) -> Result<GameDataCache> {
     })
 }
 
-fn refresh_saintcoinach_data(progress: &dyn Fn(String)) -> Result<GameDataCache> {
+fn refresh_saintcoinach_data(
+    game_dir: Option<PathBuf>,
+    progress: &dyn Fn(String),
+) -> Result<GameDataCache> {
     let item_ids = full_marketable_item_ids_for_metadata(progress);
     progress(format!(
         "Refreshing SaintCoinach game data for {} marketable item IDs.",
         item_ids.len()
     ));
-    refresh_saintcoinach_data_with_item_ids(item_ids, progress)
+    refresh_saintcoinach_data_with_item_ids(item_ids, game_dir, progress)
 }
 
 fn full_marketable_item_ids_for_metadata(progress: &dyn Fn(String)) -> Vec<u32> {
@@ -2742,13 +3102,14 @@ fn full_marketable_item_ids_for_metadata(progress: &dyn Fn(String)) -> Vec<u32> 
 
 fn refresh_saintcoinach_data_with_item_ids(
     item_ids: Vec<u32>,
+    game_dir: Option<PathBuf>,
     progress: &dyn Fn(String),
 ) -> Result<GameDataCache> {
     progress(format!(
         "Exporting SaintCoinach metadata for {} item IDs.",
         item_ids.len()
     ));
-    export_saintcoinach_cache(&item_ids, progress)
+    export_saintcoinach_cache(&item_ids, game_dir.as_deref(), progress)
         .context("failed to export SaintCoinach game data")?;
     let cache = load_game_data_cache_files(&saintcoinach_cache_dir())?;
     progress(format!(
@@ -3575,17 +3936,36 @@ fn push_vendor_source(
     });
 }
 
-fn load_market_snapshot() -> Result<MarketSnapshot> {
-    read_json_file(&universalis_cache_dir().join("market_snapshot.json"))
+fn load_market_snapshot(selection: &ServerSelection) -> Result<MarketSnapshot> {
+    let path = server_cache_dir(selection).join("market_snapshot.json");
+    let path = if !path.exists() && *selection == default_server_selection() {
+        universalis_cache_dir().join("market_snapshot.json")
+    } else {
+        path
+    };
+    let mut snapshot: MarketSnapshot = read_json_file(&path)?;
+    if snapshot.refreshed_at.is_none() {
+        snapshot.refreshed_at = path
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs() as i64);
+    }
+    Ok(snapshot)
 }
 
-fn save_market_snapshot(snapshot: &MarketSnapshot) -> Result<()> {
-    let dir = universalis_cache_dir();
+fn save_market_snapshot(selection: &ServerSelection, snapshot: &MarketSnapshot) -> Result<()> {
+    let dir = server_cache_dir(selection);
     fs::create_dir_all(&dir)?;
     write_json_file(&dir.join("market_snapshot.json"), snapshot)
 }
 
-fn export_saintcoinach_cache(item_ids: &[u32], progress: &dyn Fn(String)) -> Result<()> {
+fn export_saintcoinach_cache(
+    item_ids: &[u32],
+    game_dir: Option<&Path>,
+    progress: &dyn Fn(String),
+) -> Result<()> {
     let root = workspace_root();
     let saintcoinach_dir = root.join("Source").join("SaintCoinach");
     if !saintcoinach_dir
@@ -3612,11 +3992,17 @@ fn export_saintcoinach_cache(item_ids: &[u32], progress: &dyn Fn(String)) -> Res
 
     ensure_dotnet_sdk_available()?;
 
-    let game_dir = find_ffxiv_game_dir().ok_or_else(|| {
+    let game_dir = game_dir.ok_or_else(|| {
         anyhow!(
-            "Could not find your FFXIV install. Set FORTUNA_FFXIV_GAME_DIR to the folder containing game\\ffxivgame.ver."
+            "Could not find your FFXIV install. Choose the folder containing game\\ffxivgame.ver in the Sources section."
         )
     })?;
+    if !is_ffxiv_game_dir(game_dir) {
+        return Err(anyhow!(
+            "The selected FFXIV install folder {} does not contain game\\ffxivgame.ver. Choose the installation folder in the Sources section.",
+            game_dir.display()
+        ));
+    }
 
     let cache_dir = saintcoinach_cache_dir();
     fs::create_dir_all(&cache_dir)?;
@@ -3723,9 +4109,46 @@ fn find_ffxiv_game_dir() -> Option<PathBuf> {
         r"D:\SteamLibrary\steamapps\common\FINAL FANTASY XIV Online",
     ));
 
-    candidates
-        .into_iter()
-        .find(|path| path.join("game").join("ffxivgame.ver").exists())
+    candidates.into_iter().find(|path| is_ffxiv_game_dir(path))
+}
+
+fn is_ffxiv_game_dir(path: &Path) -> bool {
+    path.join("game").join("ffxivgame.ver").is_file()
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SavedFfxivGameDir {
+    path: PathBuf,
+}
+
+fn ffxiv_game_dir_setting_path() -> PathBuf {
+    saintcoinach_cache_dir().join("selected_game_dir.json")
+}
+
+fn load_ffxiv_game_dir_setting() -> Result<Option<PathBuf>> {
+    let path = ffxiv_game_dir_setting_path();
+    if path.exists() {
+        let saved: SavedFfxivGameDir = read_json_file(&path)?;
+        Ok(Some(saved.path))
+    } else {
+        Ok(find_ffxiv_game_dir())
+    }
+}
+
+fn save_ffxiv_game_dir(path: &Path) -> Result<()> {
+    if !is_ffxiv_game_dir(path) {
+        return Err(anyhow!(
+            "selected folder {} does not contain game\\ffxivgame.ver",
+            path.display()
+        ));
+    }
+    fs::create_dir_all(saintcoinach_cache_dir())?;
+    write_json_file(
+        &ffxiv_game_dir_setting_path(),
+        &SavedFfxivGameDir {
+            path: path.to_path_buf(),
+        },
+    )
 }
 
 fn game_data_cache_manifest(item_ids: &[u32]) -> GameDataCacheManifest {
@@ -3758,6 +4181,69 @@ fn universalis_cache_dir() -> PathBuf {
     workspace_root().join("Cache").join("Universalis")
 }
 
+fn server_cache_dir(selection: &ServerSelection) -> PathBuf {
+    universalis_cache_dir()
+        .join(selection.data_center)
+        .join(selection.world)
+}
+
+fn server_selection_path() -> PathBuf {
+    universalis_cache_dir().join("selected_server.json")
+}
+
+fn default_server_selection() -> ServerSelection {
+    find_server_selection(DEFAULT_DATA_CENTER, DEFAULT_WORLD)
+        .expect("default server must be listed in the world catalog")
+}
+
+fn logical_data_center(name: &str) -> Option<&'static LogicalDataCenter> {
+    LOGICAL_DATA_CENTERS
+        .iter()
+        .find(|data_center| data_center.name == name)
+}
+
+fn find_server_selection(data_center: &str, world: &str) -> Option<ServerSelection> {
+    let data_center = logical_data_center(data_center)?;
+    data_center
+        .worlds
+        .contains(&world)
+        .then_some(ServerSelection {
+            data_center: data_center.name,
+            world: data_center
+                .worlds
+                .iter()
+                .copied()
+                .find(|&name| name == world)?,
+        })
+}
+
+fn load_server_selection() -> Result<ServerSelection> {
+    let path = server_selection_path();
+    if !path.exists() {
+        return Ok(default_server_selection());
+    }
+    let saved: SavedServerSelection = read_json_file(&path)?;
+    find_server_selection(&saved.data_center, &saved.world).ok_or_else(|| {
+        anyhow!(
+            "saved server combination {} / {} is not in the supported world catalog",
+            saved.data_center,
+            saved.world
+        )
+    })
+}
+
+fn save_server_selection(selection: ServerSelection) -> Result<()> {
+    let dir = universalis_cache_dir();
+    fs::create_dir_all(&dir)?;
+    write_json_file(
+        &server_selection_path(),
+        &SavedServerSelection {
+            data_center: selection.data_center.to_string(),
+            world: selection.world.to_string(),
+        },
+    )
+}
+
 fn lodestone_cache_dir() -> PathBuf {
     workspace_root().join("Cache").join("Lodestone")
 }
@@ -3768,22 +4254,28 @@ fn lodestone_raw_cache_dir() -> PathBuf {
 
 fn fetch_sales_history(
     client: &reqwest::blocking::Client,
+    selection: ServerSelection,
     ids: &[u32],
     progress: &dyn Fn(String),
 ) -> Result<HashMap<u32, SaleHistory>> {
-    let mut cached_entries = load_sale_history_entries(progress);
+    let mut cached_entries = load_sale_history_entries(selection, progress);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0);
-    let cutoff = now - 7 * 86_400;
+    let cutoff = now - SALE_HISTORY_RETENTION_DAYS * 86_400;
     let ids_to_fetch = ids
         .iter()
         .copied()
         .filter(|item_id| {
-            cached_entries
-                .get(item_id)
-                .is_none_or(|entries| item_needs_recent_history_fetch(entries, cutoff, now))
+            cached_entries.get(item_id).is_none_or(|entries| {
+                item_needs_recent_history_fetch(
+                    entries,
+                    cutoff,
+                    now,
+                    SALE_HISTORY_RETENTION_DAYS as u8,
+                )
+            })
         })
         .collect::<Vec<_>>();
 
@@ -3794,7 +4286,14 @@ fn fetch_sales_history(
             "Fetching missing recent sale history ({}/{chunks}).",
             index + 1
         ));
-        fetch_sales_history_chunk(client, chunk, &mut fetched_entries, cutoff, progress)?;
+        fetch_sales_history_chunk(
+            client,
+            selection.world,
+            chunk,
+            &mut fetched_entries,
+            cutoff,
+            progress,
+        )?;
     }
 
     let fetched_count = fetched_entries.values().map(Vec::len).sum::<usize>();
@@ -3805,7 +4304,7 @@ fn fetch_sales_history(
             .append(&mut entries);
     }
     dedupe_sale_history_entries(&mut cached_entries);
-    save_sale_history_entries(&cached_entries, progress);
+    save_sale_history_entries(selection, &cached_entries, progress);
 
     let sales = ids
         .iter()
@@ -3824,7 +4323,12 @@ fn fetch_sales_history(
     Ok(sales)
 }
 
-fn item_needs_recent_history_fetch(entries: &[HistoryEntry], cutoff: i64, now: i64) -> bool {
+fn item_needs_recent_history_fetch(
+    entries: &[HistoryEntry],
+    cutoff: i64,
+    now: i64,
+    window_days: u8,
+) -> bool {
     if entries.is_empty() {
         return true;
     }
@@ -3834,16 +4338,19 @@ fn item_needs_recent_history_fetch(entries: &[HistoryEntry], cutoff: i64, now: i
         if entry.timestamp < cutoff {
             continue;
         }
-        let age_seconds = now.saturating_sub(entry.timestamp).min(7 * 86_400 - 1);
+        let age_seconds = now
+            .saturating_sub(entry.timestamp)
+            .min(i64::from(window_days) * 86_400 - 1);
         let age_days = (age_seconds / 86_400) as u8;
         seen_days.insert(age_days);
     }
 
-    seen_days.len() < 7
+    seen_days.len() < usize::from(window_days)
 }
 
 fn fetch_sales_history_chunk(
     client: &reqwest::blocking::Client,
+    world: &str,
     ids: &[u32],
     entries_by_item: &mut HashMap<u32, Vec<HistoryEntry>>,
     cutoff: i64,
@@ -3854,7 +4361,7 @@ fn fetch_sales_history_chunk(
     }
 
     let joined = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-    let url = format!("https://universalis.app/api/history/{WORLD}/{joined}?entries=500");
+    let url = format!("https://universalis.app/api/history/{world}/{joined}?entries=500");
     let response = client.get(url).send();
     let response = match response {
         Ok(response) => response,
@@ -3864,8 +4371,22 @@ fn fetch_sales_history_chunk(
                 ids.len()
             ));
             let midpoint = ids.len() / 2;
-            fetch_sales_history_chunk(client, &ids[..midpoint], entries_by_item, cutoff, progress)?;
-            fetch_sales_history_chunk(client, &ids[midpoint..], entries_by_item, cutoff, progress)?;
+            fetch_sales_history_chunk(
+                client,
+                world,
+                &ids[..midpoint],
+                entries_by_item,
+                cutoff,
+                progress,
+            )?;
+            fetch_sales_history_chunk(
+                client,
+                world,
+                &ids[midpoint..],
+                entries_by_item,
+                cutoff,
+                progress,
+            )?;
             return Ok(());
         }
         Err(err) if ids.len() == 1 && (err.is_timeout() || err.is_connect()) => {
@@ -3896,8 +4417,22 @@ fn fetch_sales_history_chunk(
             ids.len()
         ));
         let midpoint = ids.len() / 2;
-        fetch_sales_history_chunk(client, &ids[..midpoint], entries_by_item, cutoff, progress)?;
-        fetch_sales_history_chunk(client, &ids[midpoint..], entries_by_item, cutoff, progress)?;
+        fetch_sales_history_chunk(
+            client,
+            world,
+            &ids[..midpoint],
+            entries_by_item,
+            cutoff,
+            progress,
+        )?;
+        fetch_sales_history_chunk(
+            client,
+            world,
+            &ids[midpoint..],
+            entries_by_item,
+            cutoff,
+            progress,
+        )?;
         return Ok(());
     }
 
@@ -3917,22 +4452,30 @@ fn fetch_sales_history_chunk(
     Ok(())
 }
 
-fn load_sale_history_entries(progress: &dyn Fn(String)) -> HashMap<u32, Vec<HistoryEntry>> {
-    let path = sale_history_entries_path();
+fn load_sale_history_entries(
+    selection: ServerSelection,
+    progress: &dyn Fn(String),
+) -> HashMap<u32, Vec<HistoryEntry>> {
+    let path = sale_history_entries_path(selection);
     match read_json_file(&path) {
         Ok(entries) => {
             progress("Using cached Universalis sale history.".to_string());
             entries
+        }
+        Err(_) if selection == default_server_selection() => {
+            read_json_file(&universalis_cache_dir().join("sale_history_entries.json"))
+                .unwrap_or_default()
         }
         Err(_) => HashMap::new(),
     }
 }
 
 fn save_sale_history_entries(
+    selection: ServerSelection,
     entries_by_item: &HashMap<u32, Vec<HistoryEntry>>,
     progress: &dyn Fn(String),
 ) {
-    if let Some(parent) = sale_history_entries_path().parent() {
+    if let Some(parent) = sale_history_entries_path(selection).parent() {
         if let Err(err) = fs::create_dir_all(parent) {
             progress(format!(
                 "Could not create sale history cache directory: {err:#}"
@@ -3941,13 +4484,13 @@ fn save_sale_history_entries(
         }
     }
 
-    if let Err(err) = write_json_file(&sale_history_entries_path(), entries_by_item) {
+    if let Err(err) = write_json_file(&sale_history_entries_path(selection), entries_by_item) {
         progress(format!("Could not save sale history cache: {err:#}"));
     }
 }
 
-fn sale_history_entries_path() -> PathBuf {
-    universalis_cache_dir().join("sale_history_entries.json")
+fn sale_history_entries_path(selection: ServerSelection) -> PathBuf {
+    server_cache_dir(&selection).join("sale_history_entries.json")
 }
 
 fn dedupe_sale_history_entries(entries_by_item: &mut HashMap<u32, Vec<HistoryEntry>>) {
@@ -4050,6 +4593,32 @@ fn sale_history_from_entries(entries: &[HistoryEntry]) -> SaleHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn market_refresh_timestamp_uses_date_and_time() {
+        assert_eq!(format_market_refresh_time(Some(0)), "01-01-1970 00:00 UTC");
+        assert_eq!(format_market_refresh_time(None), "unknown");
+    }
+
+    #[test]
+    fn server_catalog_defaults_to_light_phoenix_and_has_unique_worlds() {
+        assert_eq!(
+            default_server_selection(),
+            ServerSelection {
+                data_center: "Light",
+                world: "Phoenix"
+            }
+        );
+
+        let mut worlds = HashSet::new();
+        for data_center in LOGICAL_DATA_CENTERS {
+            for &world in data_center.worlds {
+                assert!(worlds.insert(world), "duplicate world in catalog: {world}");
+                assert!(find_server_selection(data_center.name, world).is_some());
+            }
+        }
+        assert_eq!(worlds.len(), 85);
+    }
 
     #[test]
     fn gathered_components_are_excluded_from_crafted_total() {
@@ -4172,7 +4741,8 @@ mod tests {
         assert!(item_needs_recent_history_fetch(
             &sparse_entries,
             cutoff,
-            now
+            now,
+            7
         ));
 
         let complete_entries = [
@@ -4216,7 +4786,41 @@ mod tests {
         assert!(!item_needs_recent_history_fetch(
             &complete_entries,
             cutoff,
-            now
+            now,
+            7
+        ));
+    }
+
+    #[test]
+    fn history_cache_requires_coverage_of_ten_day_api_window() {
+        let now = 1_700_000_000_i64;
+        let cutoff = now - 10 * 86_400;
+        let seven_days = (0..7)
+            .map(|days_ago| HistoryEntry {
+                timestamp: now - i64::from(days_ago) * 86_400,
+                price_per_unit: 100,
+                quantity: 1,
+            })
+            .collect::<Vec<_>>();
+        let ten_days = (0..10)
+            .map(|days_ago| HistoryEntry {
+                timestamp: now - i64::from(days_ago) * 86_400,
+                price_per_unit: 100,
+                quantity: 1,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(item_needs_recent_history_fetch(
+            &seven_days,
+            cutoff,
+            now,
+            SALE_HISTORY_RETENTION_DAYS as u8
+        ));
+        assert!(!item_needs_recent_history_fetch(
+            &ten_days,
+            cutoff,
+            now,
+            SALE_HISTORY_RETENTION_DAYS as u8
         ));
     }
 }

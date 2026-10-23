@@ -3720,15 +3720,32 @@ fn fetch_sales_history(
     ids: &[u32],
     progress: &dyn Fn(String),
 ) -> Result<HashMap<u32, SaleHistory>> {
-    let mut fetched_entries = HashMap::new();
+    let mut cached_entries = load_sale_history_entries(progress);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let cutoff = now - 7 * 86_400;
+    let ids_to_fetch = ids
+        .iter()
+        .copied()
+        .filter(|item_id| {
+            cached_entries
+                .get(item_id)
+                .is_none_or(|entries| item_needs_recent_history_fetch(entries, cutoff, now))
+        })
+        .collect::<Vec<_>>();
 
-    let chunks = ids.chunks(MAX_MARKET_IDS_PER_REQUEST).len();
-    for (index, chunk) in ids.chunks(MAX_MARKET_IDS_PER_REQUEST).enumerate() {
-        progress(format!("Fetching sale history ({}/{chunks}).", index + 1));
-        fetch_sales_history_chunk(client, chunk, &mut fetched_entries, progress)?;
+    let mut fetched_entries = HashMap::new();
+    let chunks = ids_to_fetch.chunks(MAX_MARKET_IDS_PER_REQUEST).len();
+    for (index, chunk) in ids_to_fetch.chunks(MAX_MARKET_IDS_PER_REQUEST).enumerate() {
+        progress(format!(
+            "Fetching missing recent sale history ({}/{chunks}).",
+            index + 1
+        ));
+        fetch_sales_history_chunk(client, chunk, &mut fetched_entries, cutoff, progress)?;
     }
 
-    let mut cached_entries = load_sale_history_entries(progress);
     let fetched_count = fetched_entries.values().map(Vec::len).sum::<usize>();
     for (item_id, mut entries) in fetched_entries {
         cached_entries
@@ -3749,17 +3766,36 @@ fn fetch_sales_history(
         .collect::<HashMap<_, _>>();
 
     progress(format!(
-        "Loaded sale history for {} market items; cached {} new entries.",
+        "Loaded sale history for {} market items; cached {} new recent entries.",
         sales.len(),
         fetched_count
     ));
     Ok(sales)
 }
 
+fn item_needs_recent_history_fetch(entries: &[HistoryEntry], cutoff: i64, now: i64) -> bool {
+    if entries.is_empty() {
+        return true;
+    }
+
+    let mut seen_days = HashSet::new();
+    for entry in entries {
+        if entry.timestamp < cutoff {
+            continue;
+        }
+        let age_seconds = now.saturating_sub(entry.timestamp).min(7 * 86_400 - 1);
+        let age_days = (age_seconds / 86_400) as u8;
+        seen_days.insert(age_days);
+    }
+
+    seen_days.len() < 7
+}
+
 fn fetch_sales_history_chunk(
     client: &reqwest::blocking::Client,
     ids: &[u32],
     entries_by_item: &mut HashMap<u32, Vec<HistoryEntry>>,
+    cutoff: i64,
     progress: &dyn Fn(String),
 ) -> Result<()> {
     if ids.is_empty() {
@@ -3777,8 +3813,8 @@ fn fetch_sales_history_chunk(
                 ids.len()
             ));
             let midpoint = ids.len() / 2;
-            fetch_sales_history_chunk(client, &ids[..midpoint], entries_by_item, progress)?;
-            fetch_sales_history_chunk(client, &ids[midpoint..], entries_by_item, progress)?;
+            fetch_sales_history_chunk(client, &ids[..midpoint], entries_by_item, cutoff, progress)?;
+            fetch_sales_history_chunk(client, &ids[midpoint..], entries_by_item, cutoff, progress)?;
             return Ok(());
         }
         Err(err) if ids.len() == 1 && (err.is_timeout() || err.is_connect()) => {
@@ -3809,17 +3845,19 @@ fn fetch_sales_history_chunk(
             ids.len()
         ));
         let midpoint = ids.len() / 2;
-        fetch_sales_history_chunk(client, &ids[..midpoint], entries_by_item, progress)?;
-        fetch_sales_history_chunk(client, &ids[midpoint..], entries_by_item, progress)?;
+        fetch_sales_history_chunk(client, &ids[..midpoint], entries_by_item, cutoff, progress)?;
+        fetch_sales_history_chunk(client, &ids[midpoint..], entries_by_item, cutoff, progress)?;
         return Ok(());
     }
 
     match response.error_for_status()?.json::<HistoryResponse>()? {
-        HistoryResponse::Single(item) => {
+        HistoryResponse::Single(mut item) => {
+            item.entries.retain(|entry| entry.timestamp >= cutoff);
             entries_by_item.insert(item.item_id, item.entries);
         }
         HistoryResponse::Multi { items } => {
-            for item in items {
+            for mut item in items {
+                item.entries.retain(|entry| entry.timestamp >= cutoff);
                 entries_by_item.insert(item.item_id, item.entries);
             }
         }
@@ -3955,6 +3993,71 @@ fn sale_history_from_entries(entries: &[HistoryEntry]) -> SaleHistory {
         recent_quantity_4d,
         recent_sale_prices,
         daily_history,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn item_needs_recent_history_fetch_when_last_7_days_are_missing() {
+        let now = 1_700_000_000_i64;
+        let cutoff = now - 7 * 86_400;
+        let sparse_entries = vec![
+            HistoryEntry {
+                timestamp: now - 2 * 86_400,
+                price_per_unit: 100,
+                quantity: 1,
+            },
+            HistoryEntry {
+                timestamp: now - 6 * 86_400,
+                price_per_unit: 120,
+                quantity: 2,
+            },
+        ];
+
+        assert!(item_needs_recent_history_fetch(&sparse_entries, cutoff, now));
+
+        let complete_entries = [
+            HistoryEntry {
+                timestamp: now - 1,
+                price_per_unit: 100,
+                quantity: 1,
+            },
+            HistoryEntry {
+                timestamp: now - 1 * 86_400,
+                price_per_unit: 110,
+                quantity: 1,
+            },
+            HistoryEntry {
+                timestamp: now - 2 * 86_400,
+                price_per_unit: 120,
+                quantity: 1,
+            },
+            HistoryEntry {
+                timestamp: now - 3 * 86_400,
+                price_per_unit: 100,
+                quantity: 1,
+            },
+            HistoryEntry {
+                timestamp: now - 4 * 86_400,
+                price_per_unit: 100,
+                quantity: 1,
+            },
+            HistoryEntry {
+                timestamp: now - 5 * 86_400,
+                price_per_unit: 100,
+                quantity: 1,
+            },
+            HistoryEntry {
+                timestamp: now - 6 * 86_400,
+                price_per_unit: 100,
+                quantity: 1,
+            },
+        ];
+
+        assert!(!item_needs_recent_history_fetch(&complete_entries, cutoff, now));
     }
 }
 

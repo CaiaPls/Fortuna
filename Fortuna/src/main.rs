@@ -142,6 +142,7 @@ impl Default for ProfitCrafterApp {
                     &item_metadata,
                     &vendor_sources,
                     &recipe_materials,
+                    &gathering_items,
                     SaleValueMode::LowestLastFour,
                     RankingMode::RecentSales4d,
                 );
@@ -223,6 +224,7 @@ impl eframe::App for ProfitCrafterApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.receive_background_work(&ctx);
+        let previous_mode = self.mode;
 
         egui::Panel::top("toolbar").show_inside(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -302,6 +304,9 @@ impl eframe::App for ProfitCrafterApp {
                 }
             });
         });
+        if self.mode != previous_mode {
+            self.refresh_selected_cost_breakdown();
+        }
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let available_height = ui.available_height();
@@ -423,6 +428,7 @@ impl ProfitCrafterApp {
             &self.item_metadata,
             &self.vendor_sources,
             &self.recipe_materials,
+            &self.gathering_items,
             self.sale_value_mode,
             self.ranking_mode,
         );
@@ -1260,6 +1266,8 @@ impl ProfitCrafterApp {
             &self.item_metadata,
             &self.vendor_sources,
             &self.recipe_materials,
+            &self.gathering_items,
+            CostChoiceMode::Craft,
         );
         self.solved_macro = None;
         self.set_status(format!("Selected craft: {}", row.item_name));
@@ -1275,6 +1283,8 @@ impl ProfitCrafterApp {
             &self.item_metadata,
             &self.vendor_sources,
             &self.recipe_materials,
+            &self.gathering_items,
+            CostChoiceMode::Craft,
         );
         self.solved_macro = None;
         match row.recipe_id {
@@ -1293,9 +1303,30 @@ impl ProfitCrafterApp {
             &self.item_metadata,
             &self.vendor_sources,
             &self.recipe_materials,
+            &self.gathering_items,
+            CostChoiceMode::Market,
         );
         self.solved_macro = None;
         self.set_status(format!("Selected market item: {}", row.item_name));
+    }
+
+    fn refresh_selected_cost_breakdown(&mut self) {
+        let Some(item_id) = self.selected_item_id else {
+            return;
+        };
+        let mode = match self.mode {
+            AppMode::Market => CostChoiceMode::Market,
+            AppMode::Craft | AppMode::Gather => CostChoiceMode::Craft,
+        };
+        self.selected_cost_breakdown = explain_cost(
+            item_id,
+            &self.market_prices,
+            &self.item_metadata,
+            &self.vendor_sources,
+            &self.recipe_materials,
+            &self.gathering_items,
+            mode,
+        );
     }
 
     fn select_first_visible_craft(&mut self) {
@@ -1645,7 +1676,12 @@ impl ProfitCrafterApp {
 
         let selected_item_name = item_name(item_id);
         ui.label(egui::RichText::new(selected_item_name).strong());
-        if let Some(row) = self.rows.iter().find(|row| row.item_id == item_id) {
+        if let Some(row) = self
+            .rows
+            .iter()
+            .find(|row| row.item_id == item_id)
+            .filter(|_| !matches!(self.mode, AppMode::Market))
+        {
             ui.horizontal(|ui| {
                 ui.label(format!("Sell: {}", format_gil(row.sell_price)));
                 ui.label(format!("Cost: {}", format_gil(row.craft_cost)));
@@ -1662,7 +1698,12 @@ impl ProfitCrafterApp {
                     ui.label(format!("{} qty/4d", format_count(row.recent_quantity_4d)));
                 });
             }
-        } else if let Some(row) = self.gather_rows.iter().find(|row| row.item_id == item_id) {
+        } else if let Some(row) = self
+            .gather_rows
+            .iter()
+            .find(|row| row.item_id == item_id)
+            .filter(|_| !matches!(self.mode, AppMode::Market))
+        {
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!("Unit: {}", format_gil(row.sell_price)));
                 ui.label(format!("Profit: {}", format_gil_signed(row.profit)));
@@ -1691,7 +1732,12 @@ impl ProfitCrafterApp {
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!("Unit: {}", format_gil(row.sell_price)));
                 ui.label(format!("Avg sale: {}", format_gil(row.average_sale)));
-                if let Some(cost) = row.craft_cost {
+                let cost = if matches!(self.mode, AppMode::Market) {
+                    row.acquisition_cost
+                } else {
+                    row.craft_cost
+                };
+                if let Some(cost) = cost {
                     ui.label(format!("Cost: {}", format_gil(cost)));
                 }
                 if let Some(profit) = row.profit {
@@ -1793,7 +1839,6 @@ impl ProfitCrafterApp {
                 ui.end_row();
 
                 for node in &self.selected_cost_breakdown {
-                    let total_cost = node.unit_cost.saturating_mul(node.amount);
                     let name_width = (ui.available_width() * 0.28).clamp(120.0, 220.0);
                     let name_cell_size = egui::vec2(name_width, ui.spacing().interact_size.y);
                     if node.depth == 0 {
@@ -1802,7 +1847,7 @@ impl ProfitCrafterApp {
                         ui.strong(cost_cell(node.market_unit_cost, node.amount));
                         ui.strong(cost_cell(node.npc_unit_cost, node.amount));
                         ui.strong(cost_cell(node.craft_unit_cost, node.amount));
-                        ui.strong(format_gil(total_cost));
+                        ui.strong(cost_cell(node.chosen_unit_cost, node.amount));
                         ui.strong(&node.source);
                     } else {
                         draw_cost_tree_item_cell(ui, node, name_cell_size, false);
@@ -1810,7 +1855,7 @@ impl ProfitCrafterApp {
                         ui.label(cost_cell(node.market_unit_cost, node.amount));
                         ui.label(cost_cell(node.npc_unit_cost, node.amount));
                         ui.label(cost_cell(node.craft_unit_cost, node.amount));
-                        ui.label(format_gil(total_cost));
+                        ui.label(cost_cell(node.chosen_unit_cost, node.amount));
                         ui.label(&node.source);
                     }
                     ui.end_row();
@@ -1852,6 +1897,12 @@ impl ProfitCrafterApp {
 enum AppMode {
     Craft,
     Gather,
+    Market,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CostChoiceMode {
+    Craft,
     Market,
 }
 
@@ -2178,7 +2229,7 @@ struct CostNode {
     depth: usize,
     name: String,
     amount: u32,
-    unit_cost: u32,
+    chosen_unit_cost: Option<u32>,
     market_unit_cost: Option<u32>,
     npc_unit_cost: Option<u32>,
     craft_unit_cost: Option<u32>,
@@ -4001,6 +4052,107 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gathered_components_are_excluded_from_crafted_total() {
+        let recipe_materials = HashMap::from([(
+            100,
+            vec![
+                RecipeMaterial {
+                    item_id: 200,
+                    amount: 2,
+                },
+                RecipeMaterial {
+                    item_id: 300,
+                    amount: 3,
+                },
+            ],
+        )]);
+        let gathering_items = vec![GatheringItemInfo {
+            item_id: 200,
+            item_name: None,
+            locations: Vec::new(),
+        }];
+        let market_price = |min_listing| MarketPrice {
+            min_listing,
+            average_sale: None,
+            recent_sale_prices: Vec::new(),
+            daily_velocity: 0.0,
+            recent_sales_1d: 0,
+            recent_sales_2d: 0,
+            recent_sales_4d: 0,
+            recent_quantity_1d: 0,
+            recent_quantity_2d: 0,
+            recent_quantity_4d: 0,
+            daily_history: Vec::new(),
+            metadata: ItemMetadata::default(),
+        };
+        let market_prices = HashMap::from([
+            (100, market_price(900)),
+            (200, market_price(999)),
+            (300, market_price(50)),
+        ]);
+        let no_item_metadata: HashMap<u32, ItemMetadata> = HashMap::new();
+        let no_vendors = HashMap::new();
+
+        let gathered_breakdown = explain_cost(
+            100,
+            &market_prices,
+            &no_item_metadata,
+            &no_vendors,
+            &recipe_materials,
+            &gathering_items,
+            CostChoiceMode::Craft,
+        );
+        let non_gathered_breakdown = explain_cost(
+            100,
+            &market_prices,
+            &no_item_metadata,
+            &no_vendors,
+            &recipe_materials,
+            &[],
+            CostChoiceMode::Craft,
+        );
+        let market_breakdown = explain_cost(
+            100,
+            &market_prices,
+            &no_item_metadata,
+            &no_vendors,
+            &recipe_materials,
+            &gathering_items,
+            CostChoiceMode::Market,
+        );
+
+        assert_eq!(gathered_breakdown[0].craft_unit_cost, Some(150));
+        assert_eq!(gathered_breakdown[0].chosen_unit_cost, Some(150));
+        let gathered_ids = gathering_item_ids(&gathering_items);
+        let chosen_cost = choose_cost(
+            100,
+            &gathered_ids,
+            market_cost(100, &market_prices),
+            None,
+            gathered_breakdown[0].craft_unit_cost,
+        )
+        .unwrap();
+        assert_eq!(chosen_cost, 150);
+        assert_eq!(1_000_i64 - i64::from(chosen_cost), 850);
+        assert_eq!(gathered_breakdown[1].craft_unit_cost, Some(0));
+        assert_eq!(gathered_breakdown[1].chosen_unit_cost, Some(0));
+        assert_eq!(gathered_breakdown[2].chosen_unit_cost, Some(50));
+        assert_eq!(non_gathered_breakdown[0].craft_unit_cost, Some(2_148));
+        assert_eq!(non_gathered_breakdown[0].chosen_unit_cost, Some(2_148));
+        assert_eq!(market_breakdown[0].chosen_unit_cost, Some(2_148));
+        assert_eq!(market_breakdown[0].craft_unit_cost, Some(150));
+        let market_profit_cost =
+            market_choice_cost(100, &market_prices, &recipe_materials).unwrap();
+        assert_eq!(
+            market_profit_cost,
+            market_breakdown[0].chosen_unit_cost.unwrap()
+        );
+        assert_eq!(900_i64 - i64::from(market_profit_cost), -1_248);
+        assert_eq!(market_breakdown[1].chosen_unit_cost, Some(999));
+        assert_eq!(market_breakdown[1].craft_unit_cost, Some(0));
+    }
+
+    #[test]
     fn item_needs_recent_history_fetch_when_last_7_days_are_missing() {
         let now = 1_700_000_000_i64;
         let cutoff = now - 7 * 86_400;
@@ -4017,7 +4169,11 @@ mod tests {
             },
         ];
 
-        assert!(item_needs_recent_history_fetch(&sparse_entries, cutoff, now));
+        assert!(item_needs_recent_history_fetch(
+            &sparse_entries,
+            cutoff,
+            now
+        ));
 
         let complete_entries = [
             HistoryEntry {
@@ -4057,7 +4213,11 @@ mod tests {
             },
         ];
 
-        assert!(!item_needs_recent_history_fetch(&complete_entries, cutoff, now));
+        assert!(!item_needs_recent_history_fetch(
+            &complete_entries,
+            cutoff,
+            now
+        ));
     }
 }
 
@@ -4090,37 +4250,48 @@ fn rank_profitability(
     item_metadata: &HashMap<u32, ItemMetadata>,
     vendor_sources: &HashMap<u32, Vec<VendorSourceInfo>>,
     xiv_recipe_materials: &HashMap<u32, Vec<RecipeMaterial>>,
+    gathering_items: &[GatheringItemInfo],
     sale_value_mode: SaleValueMode,
     ranking_mode: RankingMode,
 ) -> Vec<ProfitRow> {
     let recipe_materials = recipe_materials_with_raphael_fallback(xiv_recipe_materials);
     let raphael_recipe_materials = raphael_recipe_material_map();
+    let gathered_items = gathering_item_ids(gathering_items);
     let mut memo = HashMap::new();
     let mut fallback_memo = HashMap::new();
     let mut rows = RECIPES
         .entries()
         .filter_map(|(recipe_id, recipe)| {
             let sell = market_prices.get(&recipe.item_id)?;
-            let craft_cost = craft_only_cost(
+            let craft_cost = craft_only_cost_with_gathering(
                 recipe.item_id,
                 market_prices,
                 item_metadata,
                 vendor_sources,
                 &recipe_materials,
+                &gathered_items,
                 &mut memo,
                 &mut HashSet::new(),
             )
             .or_else(|| {
-                craft_only_cost(
+                craft_only_cost_with_gathering(
                     recipe.item_id,
                     market_prices,
                     item_metadata,
                     vendor_sources,
                     &raphael_recipe_materials,
+                    &gathered_items,
                     &mut fallback_memo,
                     &mut HashSet::new(),
                 )
             })?;
+            let chosen_cost = choose_cost(
+                recipe.item_id,
+                &gathered_items,
+                market_cost(recipe.item_id, market_prices),
+                vendor_cost(recipe.item_id, market_prices, item_metadata, vendor_sources),
+                Some(craft_cost),
+            )?;
             let sale_basis = sale_value(sell, sale_value_mode);
             Some(ProfitRow {
                 recipe_id,
@@ -4133,8 +4304,8 @@ fn rank_profitability(
                     .or_else(|| sell.metadata.ui_category_name.clone()),
                 search_category_id: sell.metadata.search_category_id,
                 sell_price: sale_basis,
-                craft_cost,
-                profit: i64::from(sale_basis) - i64::from(craft_cost),
+                craft_cost: chosen_cost,
+                profit: i64::from(sale_basis) - i64::from(chosen_cost),
                 daily_velocity: sell.daily_velocity,
                 recent_sales_1d: sell.recent_sales_1d,
                 recent_sales_2d: sell.recent_sales_2d,
@@ -4267,10 +4438,7 @@ fn rank_market(
         .entries()
         .map(|(recipe_id, recipe)| (recipe.item_id, recipe_id))
         .collect::<HashMap<_, _>>();
-    let gathered_items = gathering_items
-        .iter()
-        .map(|item| item.item_id)
-        .collect::<HashSet<_>>();
+    let gathered_items = gathering_item_ids(gathering_items);
     let recipe_materials = recipe_materials_with_raphael_fallback(xiv_recipe_materials);
     let mut memo = HashMap::new();
 
@@ -4284,12 +4452,13 @@ fn rank_market(
             let price = market_prices.get(&item_id);
             let has_market_price = price.is_some();
             let craft_cost = recipe_by_item.get(&item_id).and_then(|_| {
-                craft_only_cost(
+                craft_only_cost_with_gathering(
                     item_id,
                     market_prices,
                     item_metadata,
                     vendor_sources,
                     &recipe_materials,
+                    &gathered_items,
                     &mut memo,
                     &mut HashSet::new(),
                 )
@@ -4298,12 +4467,7 @@ fn rank_market(
                 .map(|price| sale_value(price, sale_value_mode))
                 .unwrap_or_default();
             let npc_price = vendor_cost(item_id, market_prices, item_metadata, vendor_sources);
-            let acquisition_cost = match (craft_cost, npc_price) {
-                (Some(craft), Some(npc)) => Some(craft.min(npc)),
-                (Some(craft), None) => Some(craft),
-                (None, Some(npc)) => Some(npc),
-                (None, None) => None,
-            };
+            let acquisition_cost = market_choice_cost(item_id, market_prices, &recipe_materials);
             if !has_market_price && acquisition_cost.is_none() {
                 return None;
             }
@@ -4477,6 +4641,10 @@ fn raphael_recipe_material_map() -> HashMap<u32, Vec<RecipeMaterial>> {
         .collect()
 }
 
+fn gathering_item_ids(gathering_items: &[GatheringItemInfo]) -> HashSet<u32> {
+    gathering_items.iter().map(|item| item.item_id).collect()
+}
+
 fn is_gather_category_name(name: &str) -> bool {
     matches!(
         name,
@@ -4529,6 +4697,32 @@ fn craft_only_cost(
     memo: &mut HashMap<u32, Option<u32>>,
     visiting: &mut HashSet<u32>,
 ) -> Option<u32> {
+    craft_only_cost_with_gathering(
+        item_id,
+        market_prices,
+        item_metadata,
+        vendor_sources,
+        recipe_materials,
+        &HashSet::new(),
+        memo,
+        visiting,
+    )
+}
+
+fn craft_only_cost_with_gathering(
+    item_id: u32,
+    market_prices: &HashMap<u32, MarketPrice>,
+    item_metadata: &HashMap<u32, ItemMetadata>,
+    vendor_sources: &HashMap<u32, Vec<VendorSourceInfo>>,
+    recipe_materials: &HashMap<u32, Vec<RecipeMaterial>>,
+    gathered_items: &HashSet<u32>,
+    memo: &mut HashMap<u32, Option<u32>>,
+    visiting: &mut HashSet<u32>,
+) -> Option<u32> {
+    if gathered_items.contains(&item_id) {
+        memo.insert(item_id, Some(0));
+        return Some(0);
+    }
     if let Some(cost) = memo.get(&item_id) {
         return *cost;
     }
@@ -4546,6 +4740,7 @@ fn craft_only_cost(
                     item_metadata,
                     vendor_sources,
                     recipe_materials,
+                    gathered_items,
                     memo,
                     visiting,
                 )?;
@@ -4559,25 +4754,60 @@ fn craft_only_cost(
     craft_cost
 }
 
+fn choose_cost(
+    item_id: u32,
+    gathered_items: &HashSet<u32>,
+    market: Option<u32>,
+    vendor: Option<u32>,
+    craft: Option<u32>,
+) -> Option<u32> {
+    if gathered_items.contains(&item_id) {
+        Some(0)
+    } else if let Some(craft) = craft {
+        Some(vendor.map_or(craft, |vendor| vendor.min(craft)))
+    } else {
+        match (market, vendor) {
+            (Some(market), Some(vendor)) => Some(market.min(vendor)),
+            (Some(market), None) => Some(market),
+            (None, Some(vendor)) => Some(vendor),
+            (None, None) => None,
+        }
+    }
+}
+
+fn market_choice_cost(
+    item_id: u32,
+    market_prices: &HashMap<u32, MarketPrice>,
+    recipe_materials: &HashMap<u32, Vec<RecipeMaterial>>,
+) -> Option<u32> {
+    ingredient_market_cost(item_id, market_prices, recipe_materials)
+        .or_else(|| market_cost(item_id, market_prices))
+}
+
 fn craft_component_cost(
     item_id: u32,
     market_prices: &HashMap<u32, MarketPrice>,
     item_metadata: &HashMap<u32, ItemMetadata>,
     vendor_sources: &HashMap<u32, Vec<VendorSourceInfo>>,
     recipe_materials: &HashMap<u32, Vec<RecipeMaterial>>,
+    gathered_items: &HashSet<u32>,
     memo: &mut HashMap<u32, Option<u32>>,
     visiting: &mut HashSet<u32>,
 ) -> Option<u32> {
+    if gathered_items.contains(&item_id) {
+        return Some(0);
+    }
     if recipe_materials
         .get(&item_id)
         .is_some_and(|ingredients| !ingredients.is_empty())
     {
-        craft_only_cost(
+        craft_only_cost_with_gathering(
             item_id,
             market_prices,
             item_metadata,
             vendor_sources,
             recipe_materials,
+            gathered_items,
             memo,
             visiting,
         )
@@ -4592,8 +4822,11 @@ fn explain_cost(
     item_metadata: &HashMap<u32, ItemMetadata>,
     vendor_sources: &HashMap<u32, Vec<VendorSourceInfo>>,
     xiv_recipe_materials: &HashMap<u32, Vec<RecipeMaterial>>,
+    gathering_items: &[GatheringItemInfo],
+    choice_mode: CostChoiceMode,
 ) -> Vec<CostNode> {
     let recipe_materials = recipe_materials_with_raphael_fallback(xiv_recipe_materials);
+    let gathered_items = gathering_item_ids(gathering_items);
     let mut memo = HashMap::new();
     let mut nodes = Vec::new();
     explain_cost_inner(
@@ -4604,6 +4837,8 @@ fn explain_cost(
         item_metadata,
         vendor_sources,
         &recipe_materials,
+        &gathered_items,
+        choice_mode,
         &mut memo,
         &mut HashSet::new(),
         &mut nodes,
@@ -4619,49 +4854,61 @@ fn explain_cost_inner(
     item_metadata: &HashMap<u32, ItemMetadata>,
     vendor_sources: &HashMap<u32, Vec<VendorSourceInfo>>,
     recipe_materials: &HashMap<u32, Vec<RecipeMaterial>>,
+    gathered_items: &HashSet<u32>,
+    choice_mode: CostChoiceMode,
     memo: &mut HashMap<u32, Option<u32>>,
     visiting: &mut HashSet<u32>,
     nodes: &mut Vec<CostNode>,
 ) {
     let market = market_cost(item_id, market_prices);
-    let ingredient_market = ingredient_market_cost(item_id, market_prices, recipe_materials);
-    let display_market = ingredient_market.or(market);
+    let display_market = market_choice_cost(item_id, market_prices, recipe_materials);
     let vendor = vendor_cost(item_id, market_prices, item_metadata, vendor_sources);
     let vendor_rows = vendor_source_rows(item_id, vendor_sources);
-    let craft = craft_only_cost(
+    let craft = craft_only_cost_with_gathering(
         item_id,
         market_prices,
         item_metadata,
         vendor_sources,
         recipe_materials,
+        gathered_items,
         memo,
         visiting,
     );
     let ingredients = recipe_materials.get(&item_id).cloned().unwrap_or_default();
-    let (unit_cost, source) = if craft.is_some() {
-        match (vendor, craft) {
-            (Some(vendor), Some(craft)) if vendor <= craft => (vendor, "NPC".to_string()),
-            (_, Some(craft)) => (craft, "Crafted".to_string()),
-            _ => (0, "Missing".to_string()),
+    let chosen = match choice_mode {
+        CostChoiceMode::Market => display_market,
+        CostChoiceMode::Craft => choose_cost(item_id, gathered_items, market, vendor, craft),
+    };
+    let source = match choice_mode {
+        CostChoiceMode::Market => {
+            if display_market.is_some() {
+                "Market"
+            } else {
+                "Missing"
+            }
         }
-    } else {
-        match (market, vendor) {
-            (Some(market), Some(vendor)) if vendor <= market => (vendor, "NPC".to_string()),
-            (Some(market), _) => (market, "Market".to_string()),
-            (None, Some(vendor)) => (vendor, "NPC".to_string()),
-            (None, None) => (0, "Missing".to_string()),
+        CostChoiceMode::Craft if gathered_items.contains(&item_id) => "Gathered",
+        CostChoiceMode::Craft if craft.is_some() => {
+            if vendor.is_some_and(|vendor| Some(vendor) == chosen) {
+                "NPC"
+            } else {
+                "Crafted"
+            }
         }
+        CostChoiceMode::Craft if vendor.is_some_and(|vendor| Some(vendor) == chosen) => "NPC",
+        CostChoiceMode::Craft if market.is_some() => "Market",
+        CostChoiceMode::Craft => "Missing",
     };
     nodes.push(CostNode {
         depth,
         name: item_display_name(item_id, market_prices, item_metadata),
         amount,
-        unit_cost,
+        chosen_unit_cost: chosen,
         market_unit_cost: display_market,
         npc_unit_cost: vendor,
         craft_unit_cost: craft,
         npc_sources: vendor_rows,
-        source: source.clone(),
+        source: source.to_string(),
     });
 
     let should_expand_craft = source == "Crafted";
@@ -4675,6 +4922,8 @@ fn explain_cost_inner(
                 item_metadata,
                 vendor_sources,
                 recipe_materials,
+                gathered_items,
+                choice_mode,
                 memo,
                 visiting,
                 nodes,

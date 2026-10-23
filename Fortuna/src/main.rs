@@ -6,6 +6,7 @@ use std::{
     process::Command,
     sync::mpsc::{self, Receiver, Sender},
     thread,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -21,8 +22,14 @@ use serde::{Deserialize, Serialize};
 const WORLD: &str = "Phoenix";
 const DATA_CENTER: &str = "Light";
 const MAX_MARKET_IDS_PER_REQUEST: usize = 100;
-const GAME_DATA_CACHE_SCHEMA_VERSION: u32 = 5;
+const GAME_DATA_CACHE_SCHEMA_VERSION: u32 = 6;
 const UNAVAILABLE_VENDOR_PRICE: u32 = 99_999;
+const LODESTONE_BASE_URL: &str = "https://eu.finalfantasyxiv.com";
+const LODESTONE_REFRESH_BATCH_ITEMS: usize = 200;
+const LODESTONE_REFRESH_BATCH_DUTIES: usize = 200;
+const LODESTONE_REQUEST_DELAY_SECS: u64 = 5;
+const LODESTONE_DUTY_CATEGORY_IDS: &[u32] = &[2, 4, 5, 28, 37];
+const LODESTONE_DROP_REFRESH_STATE_VERSION: u32 = 3;
 
 fn main() -> eframe::Result {
     log_terminal("Starting Fortuna Profit Crafter.");
@@ -62,6 +69,7 @@ struct ProfitCrafterApp {
     item_categories: Vec<ItemCategory>,
     item_metadata: HashMap<u32, ItemMetadata>,
     vendor_sources: HashMap<u32, Vec<VendorSourceInfo>>,
+    drop_sources: HashMap<u32, Vec<DropSourceInfo>>,
     recipe_materials: HashMap<u32, Vec<RecipeMaterial>>,
     gathering_items: Vec<GatheringItemInfo>,
     pending_item_filter: Option<u32>,
@@ -103,6 +111,7 @@ impl Default for ProfitCrafterApp {
             item_categories,
             item_metadata,
             vendor_sources,
+            drop_sources,
             recipe_materials,
             gathering_items,
             mut status,
@@ -111,12 +120,14 @@ impl Default for ProfitCrafterApp {
                 cache.categories,
                 cache.item_metadata,
                 cache.vendor_sources,
+                cache.drop_sources,
                 cache.recipe_materials,
                 cache.gathering_items,
                 "Loaded stored SaintCoinach item types and recipe materials.".to_string(),
             ),
             Err(_) => (
                 Vec::new(),
+                HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
@@ -172,6 +183,7 @@ impl Default for ProfitCrafterApp {
             recipe_materials,
             gathering_items,
             vendor_sources,
+            drop_sources,
             pending_item_filter: None,
             applied_item_filter: None,
             pending_category_filter: None,
@@ -235,6 +247,12 @@ impl eframe::App for ProfitCrafterApp {
                     .clicked()
                 {
                     self.refresh_saintcoinach_data(&ctx);
+                }
+                if ui
+                    .add_enabled(!is_busy, egui::Button::new("Refresh Lodestone drops"))
+                    .clicked()
+                {
+                    self.refresh_lodestone_drops(&ctx);
                 }
                 ui.separator();
                 ui.label("Repos:");
@@ -443,6 +461,7 @@ impl ProfitCrafterApp {
                         self.recipe_materials = cache.recipe_materials;
                         self.item_metadata = cache.item_metadata;
                         self.vendor_sources = cache.vendor_sources;
+                        self.drop_sources = cache.drop_sources;
                         self.gathering_items = cache.gathering_items;
                     }
                     self.rebuild_rankings();
@@ -509,6 +528,7 @@ impl ProfitCrafterApp {
                         self.item_categories = cache.categories;
                         self.item_metadata = cache.item_metadata;
                         self.vendor_sources = cache.vendor_sources;
+                        self.drop_sources = cache.drop_sources;
                         self.recipe_materials = cache.recipe_materials;
                         self.gathering_items = cache.gathering_items;
                         self.rebuild_rankings();
@@ -610,6 +630,34 @@ impl ProfitCrafterApp {
         });
     }
 
+    fn refresh_lodestone_drops(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = mpsc::channel();
+        self.update_rx = Some(rx);
+        self.set_status("Refreshing Lodestone drop sources...");
+        self.set_progress(ActivityProgress::new(
+            "Lodestone drops",
+            "Preparing conservative Lodestone scrape.".to_string(),
+            0,
+            LODESTONE_REFRESH_BATCH_ITEMS,
+        ));
+        ctx.request_repaint();
+        thread::spawn(move || {
+            report_progress(&tx, "Preparing Lodestone drop-source refresh.");
+            let progress = |message| report_progress(&tx, message);
+            let result = refresh_lodestone_drop_sources(&progress).map(|summary| {
+                format!(
+                    "Lodestone drops updated: {} item candidate(s), {} item page(s), {} duty page(s) of {}, {} new source(s).",
+                    summary.candidate_count,
+                    summary.checked_count,
+                    summary.checked_duty_count,
+                    summary.duty_count,
+                    summary.new_source_count
+                )
+            });
+            let _ = tx.send(WorkMessage::Done(result));
+        });
+    }
+
     fn handle_market_progress(&mut self, message: String) {
         if let Some((current, total)) =
             parse_fraction_progress(&message, "Fetching current market prices (")
@@ -666,6 +714,36 @@ impl ProfitCrafterApp {
                 "Saving refreshed vendor and recipe data.".to_string(),
                 4,
                 4,
+            ));
+        } else if let Some((current, total)) =
+            parse_fraction_progress(&message, "Lodestone item page ")
+        {
+            self.set_progress(ActivityProgress::new(
+                "Lodestone drops",
+                format!(
+                    "Checking Lodestone item page {current} of {total}. Requests are delayed by {LODESTONE_REQUEST_DELAY_SECS}s."
+                ),
+                current,
+                total,
+            ));
+        } else if let Some(item_count) = parse_count_after(&message, "Lodestone candidate items: ")
+        {
+            self.set_progress(ActivityProgress::new(
+                "Lodestone drops",
+                format!("Found {item_count} unknown tradable item candidate(s)."),
+                0,
+                LODESTONE_REFRESH_BATCH_ITEMS,
+            ));
+        } else if let Some((current, total)) =
+            parse_fraction_progress(&message, "Lodestone duty page ")
+        {
+            self.set_progress(ActivityProgress::new(
+                "Lodestone drops",
+                format!(
+                    "Checking Lodestone duty page {current} of {total}. Requests are delayed by {LODESTONE_REQUEST_DELAY_SECS}s."
+                ),
+                current,
+                total,
             ));
         } else {
             self.set_status(message);
@@ -1470,6 +1548,11 @@ impl ProfitCrafterApp {
                             }
                         }
                     }
+                    if let Some(drop_sources) = self.drop_sources.get(&row.item_id) {
+                        if let Some(where_text) = drop_source_where_summary(drop_sources) {
+                            ui.small(format!("Where: {where_text}"));
+                        }
+                    }
                     ui.small(row.category_name.as_deref().unwrap_or("Unknown"));
                     ui.separator();
                 }
@@ -1626,6 +1709,19 @@ impl ProfitCrafterApp {
             });
             for source in &row.npc_sources {
                 ui.small(format!("NPC: {} - {}", source.seller, source.location));
+            }
+        }
+
+        if let Some(drop_sources) = self.drop_sources.get(&item_id) {
+            if !drop_sources.is_empty() {
+                ui.separator();
+                ui.label("Drops from");
+                for source in drop_sources.iter().take(12) {
+                    ui.small(drop_source_display(source));
+                }
+                if drop_sources.len() > 12 {
+                    ui.small(format!("...and {} more sources", drop_sources.len() - 12));
+                }
             }
         }
 
@@ -1864,6 +1960,8 @@ struct GameDataCache {
     vendor_prices: HashMap<u32, u32>,
     #[serde(default)]
     vendor_sources: HashMap<u32, Vec<VendorSourceInfo>>,
+    #[serde(default)]
+    drop_sources: HashMap<u32, Vec<DropSourceInfo>>,
     recipe_materials: HashMap<u32, Vec<RecipeMaterial>>,
     #[serde(default)]
     gathering_items: Vec<GatheringItemInfo>,
@@ -1936,6 +2034,19 @@ struct VendorSourceInfo {
     territory_name: Option<String>,
     x: Option<f64>,
     y: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct DropSourceInfo {
+    item_id: u32,
+    item_name: Option<String>,
+    source_type: String,
+    source_name: String,
+    location: Option<String>,
+    duty_name: Option<String>,
+    x: Option<f64>,
+    y: Option<f64>,
+    level_range: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2534,6 +2645,7 @@ fn load_game_data_cache_files(dir: &Path) -> Result<GameDataCache> {
     let shops: Vec<ShopInfo> = read_json_file(&dir.join("shops.json")).unwrap_or_default();
     let vendor_sources = read_json_file(&dir.join("vendor_sources.json"))
         .unwrap_or_else(|_| derive_vendor_sources(&vendor_prices, &npcs, &shops));
+    let drop_sources = read_json_file(&dir.join("drop_sources.json")).unwrap_or_default();
     let recipe_materials = read_json_file(&dir.join("recipe_materials.json")).unwrap_or_default();
     let gathering_items = read_json_file(&dir.join("gathering_items.json")).unwrap_or_default();
     Ok(GameDataCache {
@@ -2541,6 +2653,7 @@ fn load_game_data_cache_files(dir: &Path) -> Result<GameDataCache> {
         item_metadata,
         vendor_prices,
         vendor_sources,
+        drop_sources,
         recipe_materials,
         gathering_items,
     })
@@ -2604,8 +2717,731 @@ fn save_game_data_cache(cache: &GameDataCache, manifest: &GameDataCacheManifest)
     write_json_file(&dir.join("item_metadata.json"), &cache.item_metadata)?;
     write_json_file(&dir.join("vendor_prices.json"), &cache.vendor_prices)?;
     write_json_file(&dir.join("vendor_sources.json"), &cache.vendor_sources)?;
+    write_json_file(&dir.join("drop_sources.json"), &cache.drop_sources)?;
     write_json_file(&dir.join("recipe_materials.json"), &cache.recipe_materials)?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct LodestoneDropRefreshState {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    checked_item_ids: HashSet<u32>,
+    #[serde(default)]
+    checked_duty_paths: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LodestoneDropRefreshSummary {
+    candidate_count: usize,
+    checked_count: usize,
+    duty_count: usize,
+    checked_duty_count: usize,
+    new_source_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct LodestoneItemCandidate {
+    item_id: u32,
+    item_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct LodestoneDutyCandidate {
+    path: String,
+    name: String,
+}
+
+fn refresh_lodestone_drop_sources(
+    progress: &dyn Fn(String),
+) -> Result<LodestoneDropRefreshSummary> {
+    let (mut cache, manifest) = load_game_data_cache()?;
+    fs::create_dir_all(lodestone_cache_dir())?;
+    fs::create_dir_all(lodestone_raw_cache_dir())?;
+    let state_path = lodestone_cache_dir().join("drop_refresh_state.json");
+    let mut state = read_json_file::<LodestoneDropRefreshState>(&state_path).unwrap_or_default();
+    if state.version != LODESTONE_DROP_REFRESH_STATE_VERSION {
+        progress(format!(
+            "Lodestone candidate rules changed; resetting checked item state from v{} to v{}.",
+            state.version, LODESTONE_DROP_REFRESH_STATE_VERSION
+        ));
+        state = LodestoneDropRefreshState {
+            version: LODESTONE_DROP_REFRESH_STATE_VERSION,
+            checked_item_ids: HashSet::new(),
+            checked_duty_paths: state.checked_duty_paths,
+        };
+        write_json_file(&state_path, &state)?;
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("FortunaProfitCrafter/0.1 polite cached Lodestone source lookup")
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("failed to build Lodestone HTTP client")?;
+
+    let mut new_source_count = 0;
+
+    let duties = lodestone_duty_candidates(&client, progress).unwrap_or_else(|err| {
+        progress(format!("Lodestone duty list skipped: {err:#}"));
+        Vec::new()
+    });
+    let duty_batch = duties
+        .iter()
+        .filter(|duty| !state.checked_duty_paths.contains(&duty.path))
+        .take(LODESTONE_REFRESH_BATCH_DUTIES)
+        .cloned()
+        .collect::<Vec<_>>();
+    let item_ids_by_name = lodestone_sourceable_item_ids_by_name(&cache);
+
+    for (index, duty) in duty_batch.iter().enumerate() {
+        progress(format!(
+            "Lodestone duty page ({}/{}): {}",
+            index + 1,
+            duty_batch.len(),
+            duty.name
+        ));
+        match fetch_lodestone_duty_sources(&client, duty, &item_ids_by_name, progress) {
+            Ok(sources) => {
+                for source in sources {
+                    let item_sources = cache.drop_sources.entry(source.item_id).or_default();
+                    if !item_sources
+                        .iter()
+                        .any(|existing| drop_source_key(existing) == drop_source_key(&source))
+                    {
+                        item_sources.push(source);
+                        item_sources.sort_by(|left, right| {
+                            drop_source_display(left).cmp(&drop_source_display(right))
+                        });
+                        new_source_count += 1;
+                    }
+                }
+                state.checked_duty_paths.insert(duty.path.clone());
+                write_json_file(&state_path, &state)?;
+                write_json_file(
+                    &saintcoinach_cache_dir().join("drop_sources.json"),
+                    &cache.drop_sources,
+                )?;
+            }
+            Err(err) => {
+                progress(format!(
+                    "Lodestone duty lookup skipped {}: {err:#}",
+                    duty.name
+                ));
+            }
+        }
+    }
+
+    let candidates = lodestone_drop_candidates(&cache);
+    progress(format!("Lodestone candidate items: {}", candidates.len()));
+    let unchecked_candidates = candidates
+        .iter()
+        .filter(|candidate| !state.checked_item_ids.contains(&candidate.item_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut checked_count = 0;
+    let mut failed_count = 0;
+
+    if unchecked_candidates.is_empty() {
+        progress(
+            "Lodestone refresh has no unchecked item candidates in this filtered set.".to_string(),
+        );
+        write_json_file(&state_path, &state)?;
+    }
+
+    for (batch_index, batch) in unchecked_candidates
+        .chunks(LODESTONE_REFRESH_BATCH_ITEMS)
+        .enumerate()
+    {
+        progress(format!(
+            "Lodestone item batch {}: checking {} item page(s).",
+            batch_index + 1,
+            batch.len()
+        ));
+        for candidate in batch {
+            progress(format!(
+                "Lodestone item page ({}/{}): {}",
+                checked_count + failed_count + 1,
+                unchecked_candidates.len(),
+                candidate.item_name
+            ));
+
+            match fetch_lodestone_item_sources(&client, candidate, progress) {
+                Ok(sources) => {
+                    let item_sources = cache.drop_sources.entry(candidate.item_id).or_default();
+                    let mut seen = item_sources
+                        .iter()
+                        .map(drop_source_key)
+                        .collect::<HashSet<_>>();
+                    for source in sources {
+                        if seen.insert(drop_source_key(&source)) {
+                            item_sources.push(source);
+                            new_source_count += 1;
+                        }
+                    }
+                    item_sources.sort_by(|left, right| {
+                        drop_source_display(left).cmp(&drop_source_display(right))
+                    });
+                    state.checked_item_ids.insert(candidate.item_id);
+                    checked_count += 1;
+                    write_json_file(&state_path, &state)?;
+                    write_json_file(
+                        &saintcoinach_cache_dir().join("drop_sources.json"),
+                        &cache.drop_sources,
+                    )?;
+                }
+                Err(err) => {
+                    failed_count += 1;
+                    progress(format!(
+                        "Lodestone lookup skipped {}: {err:#}",
+                        candidate.item_name
+                    ));
+                }
+            }
+        }
+    }
+
+    if failed_count > 0 {
+        progress(format!(
+            "Lodestone item lookup finished with {} failed item page(s); they were not marked checked.",
+            failed_count
+        ));
+    }
+
+    save_game_data_cache(&cache, &manifest)?;
+    Ok(LodestoneDropRefreshSummary {
+        candidate_count: candidates.len(),
+        checked_count,
+        duty_count: duties.len(),
+        checked_duty_count: duty_batch.len(),
+        new_source_count,
+    })
+}
+
+fn lodestone_drop_candidates(cache: &GameDataCache) -> Vec<LodestoneItemCandidate> {
+    let candidate_item_ids = lodestone_locationless_market_item_ids(cache);
+    let mut candidates = candidate_item_ids
+        .into_iter()
+        .filter(|item_id| {
+            !cache
+                .drop_sources
+                .get(item_id)
+                .is_some_and(|sources| !sources.is_empty())
+        })
+        .filter_map(|item_id| {
+            let metadata = cache.item_metadata.get(&item_id)?;
+            let item_name = metadata.name.clone().unwrap_or_else(|| item_name(item_id));
+            (!item_name.trim().is_empty()).then_some(LodestoneItemCandidate { item_id, item_name })
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| left.item_id.cmp(&right.item_id));
+    candidates
+}
+
+fn lodestone_locationless_market_item_ids(cache: &GameDataCache) -> HashSet<u32> {
+    let crafted_outputs = cache
+        .recipe_materials
+        .keys()
+        .copied()
+        .chain(RECIPES.values.iter().map(|recipe| recipe.item_id))
+        .collect::<HashSet<_>>();
+    let gathered = cache
+        .gathering_items
+        .iter()
+        .map(|item| item.item_id)
+        .collect::<HashSet<_>>();
+
+    cache
+        .item_metadata
+        .iter()
+        .filter_map(|(&item_id, metadata)| {
+            if !is_saintcoinach_market_candidate(metadata)
+                || crafted_outputs.contains(&item_id)
+                || gathered.contains(&item_id)
+                || cache.vendor_sources.contains_key(&item_id)
+            {
+                return None;
+            }
+            Some(item_id)
+        })
+        .collect()
+}
+
+fn lodestone_sourceable_item_ids_by_name(cache: &GameDataCache) -> HashMap<String, u32> {
+    let mut counts = HashMap::<String, usize>::new();
+    let mut values = HashMap::<String, u32>::new();
+    for item_id in lodestone_locationless_market_item_ids(cache) {
+        let item_name = cache
+            .item_metadata
+            .get(&item_id)
+            .and_then(|metadata| metadata.name.clone())
+            .unwrap_or_else(|| item_name(item_id));
+        let key = item_name.to_ascii_lowercase();
+        *counts.entry(key.clone()).or_default() += 1;
+        values.insert(key, item_id);
+    }
+    values
+        .into_iter()
+        .filter(|(name, _)| counts.get(name).copied().unwrap_or_default() == 1)
+        .collect()
+}
+
+fn fetch_lodestone_item_sources(
+    client: &reqwest::blocking::Client,
+    candidate: &LodestoneItemCandidate,
+    progress: &dyn Fn(String),
+) -> Result<Vec<DropSourceInfo>> {
+    let search_html = lodestone_cached_get(
+        client,
+        &format!(
+            "{LODESTONE_BASE_URL}/lodestone/playguide/db/search/?q={}",
+            url_encode_component(&candidate.item_name)
+        ),
+        &lodestone_raw_cache_dir().join(format!("item_{}_search.html", candidate.item_id)),
+        progress,
+    )?;
+
+    let Some(item_path) = lodestone_search_item_path(&search_html, &candidate.item_name) else {
+        return Ok(Vec::new());
+    };
+
+    let item_html = lodestone_cached_get(
+        client,
+        &format!("{LODESTONE_BASE_URL}{item_path}"),
+        &lodestone_raw_cache_dir().join(format!("item_{}.html", candidate.item_id)),
+        progress,
+    )?;
+
+    Ok(parse_lodestone_item_drop_sources(candidate, &item_html))
+}
+
+fn lodestone_duty_candidates(
+    client: &reqwest::blocking::Client,
+    progress: &dyn Fn(String),
+) -> Result<Vec<LodestoneDutyCandidate>> {
+    let mut duties = Vec::new();
+    let mut seen = HashSet::new();
+    for category_id in LODESTONE_DUTY_CATEGORY_IDS {
+        let html = lodestone_cached_get(
+            client,
+            &format!("{LODESTONE_BASE_URL}/lodestone/playguide/db/duty/?category2={category_id}"),
+            &lodestone_raw_cache_dir().join(format!("duty_category_{category_id}.html")),
+            progress,
+        )?;
+        for duty in parse_lodestone_duty_links(&html) {
+            if seen.insert(duty.path.clone()) {
+                duties.push(duty);
+            }
+        }
+    }
+    duties.sort_by(|left, right| left.name.cmp(&right.name).then(left.path.cmp(&right.path)));
+    Ok(duties)
+}
+
+fn fetch_lodestone_duty_sources(
+    client: &reqwest::blocking::Client,
+    duty: &LodestoneDutyCandidate,
+    item_ids_by_name: &HashMap<String, u32>,
+    progress: &dyn Fn(String),
+) -> Result<Vec<DropSourceInfo>> {
+    let html = lodestone_cached_get(
+        client,
+        &format!("{LODESTONE_BASE_URL}{}", duty.path),
+        &lodestone_raw_cache_dir().join(format!(
+            "duty_{}.html",
+            duty.path
+                .trim_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or("unknown")
+        )),
+        progress,
+    )?;
+    Ok(parse_lodestone_duty_drop_sources(
+        duty,
+        item_ids_by_name,
+        &html,
+    ))
+}
+
+fn lodestone_cached_get(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    cache_path: &Path,
+    progress: &dyn Fn(String),
+) -> Result<String> {
+    if cache_path.exists() {
+        return fs::read_to_string(cache_path)
+            .with_context(|| format!("failed to read {}", cache_path.display()));
+    }
+
+    progress(format!(
+        "Lodestone safe delay: waiting {LODESTONE_REQUEST_DELAY_SECS}s before fetching {url}"
+    ));
+    thread::sleep(Duration::from_secs(LODESTONE_REQUEST_DELAY_SECS));
+
+    let response = client
+        .get(url)
+        .send()
+        .with_context(|| format!("failed to fetch {url}"))?
+        .error_for_status()
+        .with_context(|| format!("Lodestone returned an error for {url}"))?;
+    let html = response
+        .text()
+        .with_context(|| format!("failed to read Lodestone response for {url}"))?;
+    if let Some(parent) = cache_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(cache_path, &html)
+        .with_context(|| format!("failed to write {}", cache_path.display()))?;
+    Ok(html)
+}
+
+fn lodestone_search_item_path(html: &str, item_name: &str) -> Option<String> {
+    let marker = "class=\"db_popup db-table__txt--detail_link\"";
+    let mut offset = 0;
+    while let Some(relative) = html[offset..].find(marker) {
+        let marker_index = offset + relative;
+        let anchor_start = html[..marker_index].rfind("<a ")?;
+        let anchor_end = html[marker_index..].find("</a>")? + marker_index;
+        let anchor = &html[anchor_start..anchor_end];
+        let name = html_text(anchor).trim().to_string();
+        if name.eq_ignore_ascii_case(item_name.trim()) {
+            return html_attr(anchor, "href");
+        }
+        offset = anchor_end + 4;
+    }
+    None
+}
+
+fn parse_lodestone_duty_links(html: &str) -> Vec<LodestoneDutyCandidate> {
+    let marker = "/lodestone/playguide/db/duty/";
+    let mut duties = Vec::new();
+    let mut offset = 0;
+    while let Some(relative) = html[offset..].find(marker) {
+        let href_start = offset + relative;
+        let Some(anchor_start) = html[..href_start].rfind("<a ") else {
+            offset = href_start + marker.len();
+            continue;
+        };
+        let Some(anchor_end_relative) = html[href_start..].find("</a>") else {
+            break;
+        };
+        let anchor_end = href_start + anchor_end_relative;
+        let anchor = &html[anchor_start..anchor_end];
+        let Some(path) = html_attr(anchor, "href") else {
+            offset = anchor_end + 4;
+            continue;
+        };
+        let path = path.split('?').next().unwrap_or_default().to_string();
+        if !path.starts_with(marker)
+            || path == marker
+            || !path
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .is_some_and(|id| id.len() >= 8 && id.chars().all(|ch| ch.is_ascii_hexdigit()))
+        {
+            offset = anchor_end + 4;
+            continue;
+        }
+        let name = html_text(anchor).trim().to_string();
+        if !name.is_empty() {
+            duties.push(LodestoneDutyCandidate { path, name });
+        }
+        offset = anchor_end + 4;
+    }
+    duties
+}
+
+fn parse_lodestone_item_drop_sources(
+    candidate: &LodestoneItemCandidate,
+    html: &str,
+) -> Vec<DropSourceInfo> {
+    let mut sources = Vec::new();
+    let mut seen = HashSet::new();
+    for table in lodestone_source_tables(html) {
+        let headings = lodestone_table_headings(table);
+        if headings.iter().any(|heading| heading == "Dropped By") {
+            for row in lodestone_table_rows(table) {
+                let cells = lodestone_table_cells(row);
+                if cells.len() < 2 {
+                    continue;
+                }
+                let source_name = html_text(&cells[0]).trim().to_string();
+                if source_name.is_empty() {
+                    continue;
+                }
+                let area_text = html_text(&cells[1]);
+                let (location, x, y) = parse_lodestone_location(&area_text);
+                let source = DropSourceInfo {
+                    item_id: candidate.item_id,
+                    item_name: Some(candidate.item_name.clone()),
+                    source_type: "Mob".to_string(),
+                    source_name,
+                    location,
+                    duty_name: None,
+                    x,
+                    y,
+                    level_range: None,
+                };
+                if seen.insert(drop_source_key(&source)) {
+                    sources.push(source);
+                }
+            }
+        } else if headings.iter().any(|heading| {
+            heading.contains("Duty") || heading.contains("Treasure") || heading.contains("Coffer")
+        }) {
+            for row in lodestone_table_rows(table) {
+                let cells = lodestone_table_cells(row);
+                let source_name = cells
+                    .iter()
+                    .map(|cell| html_text(cell).trim().to_string())
+                    .find(|text| !text.is_empty())
+                    .unwrap_or_default();
+                if source_name.is_empty() {
+                    continue;
+                }
+                let source = DropSourceInfo {
+                    item_id: candidate.item_id,
+                    item_name: Some(candidate.item_name.clone()),
+                    source_type: "Treasure".to_string(),
+                    source_name: "Treasure Coffer".to_string(),
+                    location: None,
+                    duty_name: Some(source_name),
+                    x: None,
+                    y: None,
+                    level_range: None,
+                };
+                if seen.insert(drop_source_key(&source)) {
+                    sources.push(source);
+                }
+            }
+        }
+    }
+    sources
+}
+
+fn parse_lodestone_duty_drop_sources(
+    duty: &LodestoneDutyCandidate,
+    item_ids_by_name: &HashMap<String, u32>,
+    html: &str,
+) -> Vec<DropSourceInfo> {
+    let mut sources = Vec::new();
+    let mut seen = HashSet::new();
+    for popup in lodestone_treasure_box_popups(html) {
+        for item_name in lodestone_treasure_item_names(popup) {
+            let Some(&item_id) = item_ids_by_name.get(&item_name.to_ascii_lowercase()) else {
+                continue;
+            };
+            let source = DropSourceInfo {
+                item_id,
+                item_name: Some(item_name),
+                source_type: "Treasure".to_string(),
+                source_name: "Treasure Coffer".to_string(),
+                location: None,
+                duty_name: Some(duty.name.clone()),
+                x: None,
+                y: None,
+                level_range: None,
+            };
+            if seen.insert(drop_source_key(&source)) {
+                sources.push(source);
+            }
+        }
+    }
+    sources
+}
+
+fn lodestone_treasure_box_popups(html: &str) -> Vec<&str> {
+    let mut popups = Vec::new();
+    let mut offset = 0;
+    while let Some(relative) = html[offset..].find("db-view__treasure_box_popup") {
+        let marker_index = offset + relative;
+        let Some(popup_start) = html[..marker_index].rfind("<div") else {
+            offset = marker_index + 1;
+            continue;
+        };
+        let next_popup = html[marker_index + 1..]
+            .find("db-view__treasure_box_popup")
+            .map(|next| marker_index + 1 + next)
+            .unwrap_or(html.len());
+        popups.push(&html[popup_start..next_popup]);
+        offset = next_popup;
+    }
+    popups
+}
+
+fn lodestone_treasure_item_names(popup: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let marker = "/lodestone/playguide/db/item/";
+    let mut offset = 0;
+    while let Some(relative) = popup[offset..].find(marker) {
+        let href_start = offset + relative;
+        let Some(anchor_start) = popup[..href_start].rfind("<a ") else {
+            offset = href_start + marker.len();
+            continue;
+        };
+        let Some(anchor_end_relative) = popup[href_start..].find("</a>") else {
+            break;
+        };
+        let anchor_end = href_start + anchor_end_relative;
+        let anchor = &popup[anchor_start..anchor_end];
+        let name = html_text(anchor).trim().to_string();
+        if !name.is_empty() && !names.iter().any(|existing| existing == &name) {
+            names.push(name);
+        }
+        offset = anchor_end + 4;
+    }
+    names
+}
+
+fn lodestone_source_tables(html: &str) -> Vec<&str> {
+    let mut tables = Vec::new();
+    let mut offset = 0;
+    while let Some(relative) = html[offset..].find("db-table__item_source") {
+        let marker_index = offset + relative;
+        let Some(table_start) = html[..marker_index].rfind("<table") else {
+            offset = marker_index + 1;
+            continue;
+        };
+        let Some(table_end_relative) = html[marker_index..].find("</table>") else {
+            break;
+        };
+        let table_end = marker_index + table_end_relative + "</table>".len();
+        tables.push(&html[table_start..table_end]);
+        offset = table_end;
+    }
+    tables
+}
+
+fn lodestone_table_headings(table: &str) -> Vec<String> {
+    lodestone_tag_contents(table, "th")
+        .into_iter()
+        .map(|cell| html_text(cell).trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect()
+}
+
+fn lodestone_table_rows(table: &str) -> Vec<&str> {
+    lodestone_tag_contents(table, "tr")
+}
+
+fn lodestone_table_cells(row: &str) -> Vec<&str> {
+    lodestone_tag_contents(row, "td")
+}
+
+fn lodestone_tag_contents<'a>(html: &'a str, tag: &str) -> Vec<&'a str> {
+    let open_prefix = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut values = Vec::new();
+    let mut offset = 0;
+    while let Some(open_relative) = html[offset..].find(&open_prefix) {
+        let open_start = offset + open_relative;
+        let Some(open_end_relative) = html[open_start..].find('>') else {
+            break;
+        };
+        let content_start = open_start + open_end_relative + 1;
+        let Some(close_relative) = html[content_start..].find(&close) else {
+            break;
+        };
+        let content_end = content_start + close_relative;
+        values.push(&html[content_start..content_end]);
+        offset = content_end + close.len();
+    }
+    values
+}
+
+fn parse_lodestone_location(text: &str) -> (Option<String>, Option<f64>, Option<f64>) {
+    let collapsed = collapse_whitespace(text).replace(" Other Locations", "");
+    let x = parse_after_marker(&collapsed, "X:");
+    let y = parse_after_marker(&collapsed, "Y:");
+    let location = collapsed
+        .split("(X:")
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    (location, x, y)
+}
+
+fn parse_after_marker(text: &str, marker: &str) -> Option<f64> {
+    let start = text.find(marker)? + marker.len();
+    let value = text[start..]
+        .chars()
+        .skip_while(|ch| ch.is_whitespace())
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+        .collect::<String>();
+    value.parse().ok()
+}
+
+fn html_attr(html: &str, attr: &str) -> Option<String> {
+    let marker = format!("{attr}=\"");
+    let start = html.find(&marker)? + marker.len();
+    let end = html[start..].find('"')? + start;
+    Some(html_entity_decode(&html[start..end]))
+}
+
+fn html_text(html: &str) -> String {
+    let mut text = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => {
+                in_tag = true;
+                text.push(' ');
+            }
+            '>' => {
+                in_tag = false;
+                text.push(' ');
+            }
+            _ if !in_tag => text.push(ch),
+            _ => {}
+        }
+    }
+    html_entity_decode(&collapse_whitespace(&text))
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn html_entity_decode(text: &str) -> String {
+    text.replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&ndash;", "-")
+        .replace("&mdash;", "-")
+}
+
+fn url_encode_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            b' ' => encoded.push('+'),
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn drop_source_key(source: &DropSourceInfo) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{:.1}|{:.1}",
+        source.item_id,
+        source.source_type,
+        source.source_name,
+        source.location.as_deref().unwrap_or_default(),
+        source.duty_name.as_deref().unwrap_or_default(),
+        source.x.unwrap_or_default(),
+        source.y.unwrap_or_default()
+    )
 }
 
 fn derive_vendor_sources(
@@ -2766,6 +3602,11 @@ fn export_saintcoinach_cache(item_ids: &[u32], progress: &dyn Fn(String)) -> Res
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines().filter(|line| {
+        line.contains("No Libra drop database loaded") || line.contains("Using Libra drop database")
+    }) {
+        progress(line.to_string());
+    }
     let line_count = stdout
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -2864,6 +3705,14 @@ fn saintcoinach_cache_dir() -> PathBuf {
 
 fn universalis_cache_dir() -> PathBuf {
     workspace_root().join("Cache").join("Universalis")
+}
+
+fn lodestone_cache_dir() -> PathBuf {
+    workspace_root().join("Cache").join("Lodestone")
+}
+
+fn lodestone_raw_cache_dir() -> PathBuf {
+    lodestone_cache_dir().join("raw")
 }
 
 fn fetch_sales_history(
@@ -3834,6 +4683,83 @@ fn vendor_source_display(source: &VendorSourceInfo) -> VendorSourceDisplay {
         seller: vendor_source_seller(source),
         location: vendor_source_location(source),
     }
+}
+
+fn drop_source_display(source: &DropSourceInfo) -> String {
+    let mut text = match source
+        .duty_name
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        Some(duty) => format!("{}: {} - {}", source.source_type, source.source_name, duty),
+        None => format!("{}: {}", source.source_type, source.source_name),
+    };
+
+    if let Some(location) = source.location.as_deref().filter(|value| !value.is_empty()) {
+        text.push_str(" - ");
+        text.push_str(location);
+    }
+    if let (Some(x), Some(y)) = (source.x, source.y) {
+        text.push_str(&format!(" ({x:.1}, {y:.1})"));
+    }
+    if let Some(level_range) = source
+        .level_range
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        text.push_str(&format!(" Lv. {level_range}"));
+    }
+    text
+}
+
+fn drop_source_where_summary(sources: &[DropSourceInfo]) -> Option<String> {
+    if sources.is_empty() {
+        return None;
+    }
+
+    let mut values = sources
+        .iter()
+        .map(drop_source_where_label)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+
+    if values.is_empty() {
+        return None;
+    }
+
+    let shown = values.iter().take(3).cloned().collect::<Vec<_>>();
+    let remaining = values.len().saturating_sub(shown.len());
+    let mut text = shown.join("; ");
+    if remaining > 0 {
+        text.push_str(&format!("; +{} more", format_count(remaining)));
+    }
+    Some(text)
+}
+
+fn drop_source_where_label(source: &DropSourceInfo) -> String {
+    let mut text = match source
+        .duty_name
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        Some(duty) => format!("{}: {}", source.source_name, duty),
+        None => source.source_name.clone(),
+    };
+
+    if let Some(location) = source.location.as_deref().filter(|value| !value.is_empty()) {
+        if text.is_empty() {
+            text.push_str(location);
+        } else {
+            text.push_str(" - ");
+            text.push_str(location);
+        }
+    }
+    if let (Some(x), Some(y)) = (source.x, source.y) {
+        text.push_str(&format!(" ({x:.1}, {y:.1})"));
+    }
+    text
 }
 
 fn vendor_source_label(source: &VendorSourceInfo) -> String {

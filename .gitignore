@@ -6,5 +6,6 @@ Source/Fortuna.SaintCoinachExporter/
 Cache/
 Cache/SaintCoinach/
 Cache/Universalis/
+Cache/Lodestone/
 **/target/
 *.pdb

@@ -69,6 +69,7 @@ The cache includes:
 - `npcs.json`
 - `places.json`
 - `recipe_materials.json`
+- `drop_sources.json`
 - `shops.json`
 - `territories.json`
 - `vendor_prices.json`
@@ -78,11 +79,14 @@ When the cache is missing, incomplete, or built for an older market-visible item
 - item search categories and display names,
 - item metadata for Universalis-visible recipe and ingredient IDs,
 - recipe material lists,
+- optional mob and treasure drop sources when a Libra Eorzea database is supplied with `FORTUNA_LIBRA_DB`,
 - gathering items,
 - NPC, shop, map, territory, and place names,
 - NPC gil vendor prices from item metadata.
 
 Universalis market data is stored locally in `Cache/Universalis/market_snapshot.json` after a market refresh. Fortuna loads that snapshot on startup and only contacts Universalis again when you click the Universalis refresh button.
+
+Drop sources can also be enriched from the Lodestone Eorzea Database with the separate `Refresh Lodestone drops` button. This is intentionally conservative: it only considers tradable market candidates that are not final crafted items, already gathered, or NPC-buyable, caches raw Lodestone pages under ignored `Cache/Lodestone/`, waits 5 seconds before uncached requests, checks up to 200 duty pages first, then drains unchecked item candidates in 200-page chunks until no unchecked candidates remain for that run. Checked pages are recorded so later refreshes resume instead of starting over. Duty-page scraping reads treasure coffer item lists from Lodestone duty categories such as dungeons, trials, raids, ultimate raids, and chaotic alliance raids; item-page scraping also catches mob `Dropped By` tables with overworld coordinates when Lodestone provides them.
 
 This metadata is merged with live Universalis pricing so the app can:
 
